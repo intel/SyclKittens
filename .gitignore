@@ -1,0 +1,33 @@
+# Build products
+build/
+**/build/
+*.o
+*.so
+*.a
+*.d
+*.out
+unit_tests
+
+# Compiler and profiler output
+*.spv
+*.bc
+*.asm
+*.gpu
+*.igc
+*.log
+vtune*/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Generated data and local state
+*.bin
+*.pt
+*.txt
+benchmarks/results/
+.vscode/
+.clangd
+.claude/
+.cursor/

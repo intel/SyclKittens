@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://syclkittens.dev/schemas/run-manifest.schema.json",
+  "title": "SyclKittens benchmark run manifest",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "suite",
+    "timestamp_utc",
+    "host",
+    "source",
+    "toolchain",
+    "environment"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "suite": {"type": "string", "minLength": 1},
+    "timestamp_utc": {"type": "string"},
+    "host": {
+      "type": "object",
+      "required": ["hostname", "platform"]
+    },
+    "source": {
+      "type": "object",
+      "required": ["kind"]
+    },
+    "toolchain": {"type": "object"},
+    "environment": {"type": "object"}
+  },
+  "additionalProperties": false
+}

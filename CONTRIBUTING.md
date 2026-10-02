@@ -2,7 +2,7 @@
 
 ### License
 
-<PROJECT NAME> is licensed under the terms in [LICENSE]<link to license file in repo>. By contributing to the project, you agree to the license and copyright terms therein and release your contribution under these terms.
+SyclKittens is licensed under the terms in [MIT LICENSE](https://github.com/intel/SyclKittens/blob/main/LICENSE). By contributing to the project, you agree to the license and copyright terms therein and release your contribution under these terms.
 
 ### Sign your work
 
