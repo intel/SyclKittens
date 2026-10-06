@@ -7,6 +7,8 @@ model ([announcement](https://hazyresearch.stanford.edu/blog/2026-02-19-tk-2)):
 reusable primitives live under `include/`, kernels carry their own build files,
 and the API test suite lives under `tests/`.
 
+Paper: [SyclKittens: A Tile Programming Model for Programmers and Coding Agents on Intel GPUs](https://arxiv.org/abs/2610.04277) (arXiv:2610.04277).
+
 ## Requirements
 
 - Intel oneAPI DPC++ compiler with `icpx` and SYCL 2020 support
