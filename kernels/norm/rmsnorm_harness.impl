@@ -1,0 +1,115 @@
+// Standalone harness for rmsnorm.dp.cpp (CONFIG=standalone, no PyTorch).
+// Included at the end of rmsnorm.dp.cpp when TORCH_COMPILE is not defined, so
+// RMSNORM_D and launch_rmsnorm_v6() are already in scope.
+//
+//   usage: rmsnorm [iters=100] [warmup=10]
+//   pick the GPU with ONEAPI_DEVICE_SELECTOR / ZE_AFFINITY_MASK.
+
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
+
+// Deterministic values in [-1, 1) so the run is reproducible.
+static float lcg_uniform(uint32_t &state) {
+    state = state * 1664525u + 1013904223u;
+    return static_cast<float>(state >> 8) / static_cast<float>(1u << 23) - 1.0f;
+}
+
+static double rel_l2(const std::vector<bf16> &got, const std::vector<float> &ref) {
+    double err2 = 0.0, ref2 = 0.0;
+    for (size_t i = 0; i < ref.size(); i++) {
+        const double d = double(float(got[i])) - ref[i];
+        err2 += d * d;
+        ref2 += double(ref[i]) * ref[i];
+    }
+    return std::sqrt(err2 / (ref2 + 1e-30));
+}
+
+// One case: T tokens (B=1, N=T). Returns true on PASS.
+template <bool RESIDUAL>
+static bool run_case(sycl::queue &q, int T, int iters, int warmup) {
+    constexpr int D = RMSNORM_D;
+    constexpr float eps = 1e-6f;
+    const size_t n = size_t(T) * D;
+
+    std::vector<bf16> h_x(n), h_r(n), h_w(D);
+    uint32_t seed = 12345u + T;
+    for (auto &v : h_x) v = bf16(lcg_uniform(seed));
+    for (auto &v : h_r) v = bf16(lcg_uniform(seed));
+    for (auto &v : h_w) v = bf16(1.0f + 0.1f * lcg_uniform(seed));
+
+    bf16 *d_x = sycl::malloc_device<bf16>(n, q), *d_r = sycl::malloc_device<bf16>(n, q);
+    bf16 *d_w = sycl::malloc_device<bf16>(D, q);
+    bf16 *d_o = sycl::malloc_device<bf16>(n, q), *d_or = sycl::malloc_device<bf16>(n, q);
+    float *d_inv = sycl::malloc_device<float>(T, q);
+    q.memcpy(d_x, h_x.data(), n * sizeof(bf16));
+    q.memcpy(d_r, h_r.data(), n * sizeof(bf16));
+    q.memcpy(d_w, h_w.data(), D * sizeof(bf16));
+    q.wait();
+
+    auto launch = [&] {
+        launch_rmsnorm_v6<D, RMSNORM_WARPS_PER_ROW, RESIDUAL, RESIDUAL>(
+            q, d_x, RESIDUAL ? d_r : nullptr, d_w, d_o, RESIDUAL ? d_or : nullptr,
+            d_inv, 1, T, eps);
+    };
+    for (int i = 0; i < warmup; i++) launch();
+    q.wait();
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < iters; i++) launch();
+    q.wait();
+    const auto t1 = std::chrono::high_resolution_clock::now();
+    const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / iters;
+    // Compulsory traffic: read x (+residual), write out (+residual_out).
+    const double gbps = (RESIDUAL ? 4.0 : 2.0) * n * sizeof(bf16) / (ms * 1e-3) / 1e9;
+
+    std::vector<bf16> h_o(n), h_or(n);
+    q.memcpy(h_o.data(), d_o, n * sizeof(bf16));
+    if (RESIDUAL) q.memcpy(h_or.data(), d_or, n * sizeof(bf16));
+    q.wait();
+
+    // fp32 reference: h = x (+ r); out = h * rsqrt(mean(h^2) + eps) * w.
+    std::vector<float> ref_o(n), ref_h(n);
+    for (int t = 0; t < T; t++) {
+        const size_t base = size_t(t) * D;
+        double ss = 0.0;
+        for (int d = 0; d < D; d++) {
+            float h = float(h_x[base + d]) + (RESIDUAL ? float(h_r[base + d]) : 0.0f);
+            ref_h[base + d] = h;
+            ss += double(h) * h;
+        }
+        const float inv = 1.0f / std::sqrt(float(ss / D) + eps);
+        for (int d = 0; d < D; d++) ref_o[base + d] = ref_h[base + d] * inv * float(h_w[d]);
+    }
+    const double err = rel_l2(h_o, ref_o);
+    const double err_r = RESIDUAL ? rel_l2(h_or, ref_h) : 0.0;
+    const bool pass = err < 1e-2 && err_r < 1e-2;
+
+    char resid[48] = "";
+    if (RESIDUAL) std::snprintf(resid, sizeof(resid), "  resid_rel_l2=%.2e", err_r);
+    std::printf("rmsnorm%s T=%-5d D=%d: %8.4f ms  %7.1f GB/s  rel_l2=%.2e%s  %s\n",
+                RESIDUAL ? "+residual" : "         ", T, D, ms, gbps, err, resid,
+                pass ? "PASS" : "FAIL");
+
+    for (void *p : {(void *)d_x, (void *)d_r, (void *)d_w, (void *)d_o, (void *)d_or, (void *)d_inv})
+        sycl::free(p, q);
+    return pass;
+}
+
+int main(int argc, char **argv) {
+    const int iters  = argc > 1 ? std::atoi(argv[1]) : 100;
+    const int warmup = argc > 2 ? std::atoi(argv[2]) : 10;
+
+    sycl::queue q{sycl::gpu_selector_v, sycl::property::queue::in_order{}};
+    std::printf("Device: %s  (iters=%d warmup=%d)\n",
+                q.get_device().get_info<sycl::info::device::name>().c_str(), iters, warmup);
+
+    bool ok = true;
+    for (int T : {1, 2048, 8192}) {
+        ok &= run_case<false>(q, T, iters, warmup);
+        ok &= run_case<true>(q, T, iters, warmup);
+    }
+    return ok ? 0 : 1;
+}

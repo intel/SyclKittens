@@ -10,6 +10,14 @@ GPU_TARGET ?= intel_gpu_pvc
 BUILD_DIR ?= build
 SYCL_TARGET_FLAGS ?= -fsycl-targets=$(GPU_TARGET)
 
+# Build mode for kernels that ship a harness (<kernel>_harness.impl):
+#   standalone : executable whose main() comes from the harness; SYCL only, no torch (default)
+#   pytorch    : Python extension built with -DTORCH_COMPILE
+CONFIG ?= standalone
+ifeq ($(filter $(CONFIG),pytorch standalone),)
+$(error CONFIG must be pytorch or standalone, got '$(CONFIG)')
+endif
+
 SPIRV_FLAGS := -Xspirv-translator -spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate
 COMMON_SYCL_FLAGS := -fsycl $(SYCL_TARGET_FLAGS) -std=c++20 -O3 -fsycl-unnamed-lambda -Wno-deprecated-declarations $(SPIRV_FLAGS) -DKITTENS_INTEL -DKITTENS_XE -DKITTENS_FAST_BF16_CONVERT -I$(SK_ROOT)/include
 

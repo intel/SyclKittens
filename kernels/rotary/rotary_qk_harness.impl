@@ -1,0 +1,113 @@
+// Standalone harness for rotary_qk.dp.cpp (CONFIG=standalone, no PyTorch).
+// Included at the end of rotary_qk.dp.cpp when TORCH_COMPILE is not defined,
+// so ROTARY_D and launch_rotary_qk() are already in scope.
+//
+//   usage: rotary_qk [iters=100] [warmup=10]
+//   pick the GPU with ONEAPI_DEVICE_SELECTOR / ZE_AFFINITY_MASK.
+
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
+
+// Deterministic values in [-1, 1) so the run is reproducible.
+static float lcg_uniform(uint32_t &state) {
+    state = state * 1664525u + 1013904223u;
+    return static_cast<float>(state >> 8) / static_cast<float>(1u << 23) - 1.0f;
+}
+
+// Max |out - ref| over one (B, N, heads, D) tensor rotated with (N, D/2) cos/sin.
+static double rope_max_err(const std::vector<bf16> &x, const std::vector<bf16> &out,
+                           const std::vector<bf16> &cs, const std::vector<bf16> &sn,
+                           int B, int N, int heads, bool negate_sin) {
+    constexpr int D = ROTARY_D, HALF = D / 2;
+    double max_err = 0.0;
+    for (size_t row = 0; row < size_t(B) * N * heads; row++) {
+        const int n = int((row / heads) % N);
+        for (int d = 0; d < HALF; d++) {
+            const float a = float(x[row * D + d]), b = float(x[row * D + HALF + d]);
+            const float c = float(cs[size_t(n) * HALF + d]);
+            const float s = negate_sin ? -float(sn[size_t(n) * HALF + d]) : float(sn[size_t(n) * HALF + d]);
+            const double r1 = a * c - b * s, r2 = b * c + a * s;
+            max_err = std::fmax(max_err, std::fabs(double(float(out[row * D + d])) - r1));
+            max_err = std::fmax(max_err, std::fabs(double(float(out[row * D + HALF + d])) - r2));
+        }
+    }
+    return max_err;
+}
+
+// One forward (negate_sin=false) or backward (negate_sin=true) case; returns pass.
+static bool run_case(sycl::queue &queue, int B, int N, int H, int HKV, bool negate_sin,
+                     int iters, int warmup) {
+    constexpr int D = ROTARY_D, HALF = D / 2;
+    const size_t nq = size_t(B) * N * H * D, nk = size_t(B) * N * HKV * D, ncs = size_t(N) * HALF;
+
+    uint32_t seed = 54321u + uint32_t(N) * 7u + (negate_sin ? 1u : 0u);
+    std::vector<bf16> h_q(nq), h_k(nk), h_cos(ncs), h_sin(ncs), h_qo(nq), h_ko(nk);
+    for (auto &v : h_q) v = bf16(lcg_uniform(seed));
+    for (auto &v : h_k) v = bf16(lcg_uniform(seed));
+    for (size_t i = 0; i < ncs; i++) {
+        const float ang = 3.14159265f * lcg_uniform(seed);
+        h_cos[i] = bf16(std::cos(ang));
+        h_sin[i] = bf16(std::sin(ang));
+    }
+
+    bf16 *d_q  = sycl::malloc_device<bf16>(nq, queue);
+    bf16 *d_qo = sycl::malloc_device<bf16>(nq, queue);
+    bf16 *d_k  = sycl::malloc_device<bf16>(nk, queue);
+    bf16 *d_ko = sycl::malloc_device<bf16>(nk, queue);
+    bf16 *d_cos = sycl::malloc_device<bf16>(ncs, queue);
+    bf16 *d_sin = sycl::malloc_device<bf16>(ncs, queue);
+    queue.memcpy(d_q, h_q.data(), nq * sizeof(bf16));
+    queue.memcpy(d_k, h_k.data(), nk * sizeof(bf16));
+    queue.memcpy(d_cos, h_cos.data(), ncs * sizeof(bf16));
+    queue.memcpy(d_sin, h_sin.data(), ncs * sizeof(bf16));
+    queue.wait();
+
+    auto launch = [&] {
+        if (negate_sin)
+            launch_rotary_qk<D, true >(queue, d_q, d_qo, d_k, d_ko, d_cos, d_sin, B, N, H, HKV);
+        else
+            launch_rotary_qk<D, false>(queue, d_q, d_qo, d_k, d_ko, d_cos, d_sin, B, N, H, HKV);
+    };
+    for (int i = 0; i < warmup; i++) launch();
+    queue.wait();
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < iters; i++) launch();
+    queue.wait();
+    const auto t1 = std::chrono::high_resolution_clock::now();
+    const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / iters;
+    const double bytes = 2.0 * (nq + nk) * sizeof(bf16) + 2.0 * ncs * sizeof(bf16);
+
+    queue.memcpy(h_qo.data(), d_qo, nq * sizeof(bf16));
+    queue.memcpy(h_ko.data(), d_ko, nk * sizeof(bf16));
+    queue.wait();
+    const double max_err = std::fmax(rope_max_err(h_q, h_qo, h_cos, h_sin, B, N, H, negate_sin),
+                                     rope_max_err(h_k, h_ko, h_cos, h_sin, B, N, HKV, negate_sin));
+    const bool pass = max_err <= 1e-2;
+    std::printf("rotary_qk %s B=%d T=%d H=%d HKV=%d D=%d: %.4f ms  %.1f GB/s  max_err=%.2e  %s\n",
+                negate_sin ? "bwd" : "fwd", B, N, H, HKV, D, ms, bytes / (ms * 1e-3) / 1e9,
+                max_err, pass ? "PASS" : "FAIL");
+
+    sycl::free(d_q, queue); sycl::free(d_qo, queue);
+    sycl::free(d_k, queue); sycl::free(d_ko, queue);
+    sycl::free(d_cos, queue); sycl::free(d_sin, queue);
+    return pass;
+}
+
+int main(int argc, char **argv) {
+    const int iters  = argc > 1 ? std::atoi(argv[1]) : 100;
+    const int warmup = argc > 2 ? std::atoi(argv[2]) : 10;
+
+    sycl::queue queue{sycl::gpu_selector_v, sycl::property::queue::in_order{}};
+    std::printf("Device: %s  (iters=%d warmup=%d)\n",
+                queue.get_device().get_info<sycl::info::device::name>().c_str(), iters, warmup);
+
+    bool ok = true;
+    for (int T : {1, 2048})
+        for (bool bwd : {false, true})
+            ok &= run_case(queue, /*B=*/1, T, /*H=*/32, /*HKV=*/8, bwd, iters, warmup);
+    return ok ? 0 : 1;
+}

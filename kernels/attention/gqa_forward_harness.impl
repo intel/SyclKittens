@@ -1,0 +1,116 @@
+// Standalone harness for gqa_forward.dp.cpp (CONFIG=standalone, no PyTorch).
+// Included at the end of gqa_forward.dp.cpp when TORCH_COMPILE is not defined,
+// so ATTN_H/ATTN_H_KV/ATTN_D and run_fwd() are already in scope.
+//
+//   usage: gqa_forward [iters=100] [warmup=10]
+//   pick the GPU with ONEAPI_DEVICE_SELECTOR / ZE_AFFINITY_MASK.
+//
+// Runs B=1, N=4096 causal and non-causal (bf16 out) and checks sampled output
+// rows and their logsumexp L against an fp32 CPU reference.
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
+
+// Deterministic values in [-1, 1) so the run is reproducible.
+static float lcg_uniform(uint32_t &state) {
+    state = state * 1664525u + 1013904223u;
+    return static_cast<float>(state >> 8) / static_cast<float>(1u << 23) - 1.0f;
+}
+
+int main(int argc, char **argv) {
+    const int iters  = argc > 1 ? std::atoi(argv[1]) : 100;
+    const int warmup = argc > 2 ? std::atoi(argv[2]) : 10;
+    constexpr int B = 1, N = 4096, H = ATTN_H, HKV = ATTN_H_KV, D = ATTN_D;
+    constexpr int GROUP = H / HKV;
+
+    sycl::queue queue{sycl::gpu_selector_v, sycl::property::queue::in_order{}};
+    std::printf("Device: %s\n",
+                queue.get_device().get_info<sycl::info::device::name>().c_str());
+
+    const size_t size_q = size_t(B) * N * H * D, size_kv = size_t(B) * N * HKV * D;
+    std::vector<bf16> h_q(size_q), h_k(size_kv), h_v(size_kv);
+    uint32_t seed = 12345u;
+    for (auto &x : h_q) x = bf16(lcg_uniform(seed));
+    for (auto &x : h_k) x = bf16(lcg_uniform(seed));
+    for (auto &x : h_v) x = bf16(lcg_uniform(seed));
+
+    bf16  *d_q = sycl::malloc_device<bf16>(size_q, queue);
+    bf16  *d_k = sycl::malloc_device<bf16>(size_kv, queue);
+    bf16  *d_v = sycl::malloc_device<bf16>(size_kv, queue);
+    bf16  *d_o = sycl::malloc_device<bf16>(size_q, queue);
+    float *d_l = sycl::malloc_device<float>(size_t(B) * H * N, queue);
+    queue.memcpy(d_q, h_q.data(), size_q * sizeof(bf16));
+    queue.memcpy(d_k, h_k.data(), size_kv * sizeof(bf16));
+    queue.memcpy(d_v, h_v.data(), size_kv * sizeof(bf16));
+    queue.wait();
+
+    auto q_at = [&](int n, int h, int d) { return float(h_q[(size_t(n) * H + h) * D + d]); };
+    auto k_at = [&](int n, int h, int d) { return float(h_k[(size_t(n) * HKV + h) * D + d]); };
+    auto v_at = [&](int n, int h, int d) { return float(h_v[(size_t(n) * HKV + h) * D + d]); };
+
+    bool all_pass = true;
+    for (bool causal : {true, false}) {
+        for (int i = 0; i < warmup; i++)
+            run_fwd(queue, d_q, d_k, d_v, d_o, true, d_l, B, N, causal);
+        queue.wait();
+        const auto t0 = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < iters; i++)
+            run_fwd(queue, d_q, d_k, d_v, d_o, true, d_l, B, N, causal);
+        queue.wait();
+        const auto t1 = std::chrono::high_resolution_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / iters;
+        const double flops = 4.0 * B * H * double(N) * N * D * (causal ? 0.5 : 1.0);
+
+        std::vector<bf16> h_o(size_q);
+        std::vector<float> h_l(size_t(B) * H * N);
+        queue.memcpy(h_o.data(), d_o, size_q * sizeof(bf16));
+        queue.memcpy(h_l.data(), d_l, h_l.size() * sizeof(float));
+        queue.wait();
+
+        // Sampled (head, query) rows, incl. the first and last query.
+        double max_err = 0.0, err2 = 0.0, ref2 = 0.0, max_l_err = 0.0;
+        const int rows[][2] = {{0, 0}, {0, N - 1}, {H - 1, 17}, {H / 2, N / 2},
+                               {1 % H, 1023}, {H - 1, N - 1}, {GROUP % H, 2049}, {H / 3, 3001}};
+        std::vector<double> s(N), o(D);
+        for (const auto &rq : rows) {
+            const int h = rq[0], qi = rq[1], kvh = h / GROUP;
+            const int n_kv = causal ? qi + 1 : N;
+            double m = -1e300;
+            for (int j = 0; j < n_kv; j++) {
+                double dot = 0.0;
+                for (int d = 0; d < D; d++) dot += double(q_at(qi, h, d)) * k_at(j, kvh, d);
+                s[j] = dot / std::sqrt(double(D));
+                m = std::max(m, s[j]);
+            }
+            double sum = 0.0;
+            for (int j = 0; j < n_kv; j++) { s[j] = std::exp(s[j] - m); sum += s[j]; }
+            std::fill(o.begin(), o.end(), 0.0);
+            for (int j = 0; j < n_kv; j++)
+                for (int d = 0; d < D; d++) o[d] += s[j] / sum * v_at(j, kvh, d);
+            for (int d = 0; d < D; d++) {
+                const double got = float(h_o[(size_t(qi) * H + h) * D + d]);
+                max_err = std::max(max_err, std::fabs(got - o[d]));
+                err2 += (got - o[d]) * (got - o[d]);
+                ref2 += o[d] * o[d];
+            }
+            const double l_ref = m + std::log(sum);
+            max_l_err = std::max(max_l_err, std::fabs(double(h_l[size_t(h) * N + qi]) - l_ref));
+        }
+        const double rel = std::sqrt(err2 / (ref2 + 1e-30));
+        const bool pass = max_err < 0.05 && rel < 2e-2 && max_l_err < 2e-2;
+        all_pass &= pass;
+        std::printf("GQA fwd B%d N%d H%d/%d D%d %s: %.3f ms  %.1f TFLOP/s  "
+                    "(iters=%d warmup=%d)  max_err=%.4f rel_l2=%.2e L_err=%.2e  %s\n",
+                    B, N, H, HKV, D, causal ? "causal" : "full", ms, flops / (ms * 1e-3) / 1e12,
+                    iters, warmup, max_err, rel, max_l_err, pass ? "PASS" : "FAIL");
+    }
+
+    sycl::free(d_q, queue); sycl::free(d_k, queue); sycl::free(d_v, queue);
+    sycl::free(d_o, queue); sycl::free(d_l, queue);
+    return all_pass ? 0 : 1;
+}

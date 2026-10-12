@@ -500,6 +500,21 @@ static void launch_splitk(kittens::bf16 *d_A, kittens::bf16 *d_B,
 #endif  // GEMM_NO_SPLITK_CODE
 
 // ============================================================
+// Shared entry: C = A @ B on raw device pointers (used by both builds).
+// Enqueues only; the caller synchronizes.
+// ============================================================
+
+static void run_gemm(kittens::bf16 *d_A, kittens::bf16 *d_B,
+                     typename _gl_C::dtype *d_C, sycl::queue &queue) {
+#ifdef GEMM_NO_SPLITK_CODE
+    dispatch_micro(d_A, d_B, d_C, queue);
+#else
+    launch_splitk(d_A, d_B, d_C, queue);
+#endif
+}
+
+#ifdef TORCH_COMPILE
+// ============================================================
 // PyTorch dispatch — wall-clock timing done by caller
 // ============================================================
 
@@ -539,11 +554,7 @@ void dispatch_gemm(torch::Tensor A, torch::Tensor B, torch::Tensor C) {
     bf16  *d_C = reinterpret_cast<bf16*>(C.data_ptr<c10::BFloat16>());
 #endif
 
-#ifdef GEMM_NO_SPLITK_CODE
-    dispatch_micro(d_A, d_B, d_C, queue);
-#else
-  launch_splitk(d_A, d_B, d_C, queue);
-#endif
+    run_gemm(d_A, d_B, d_C, queue);
     // No queue.wait() — caller synchronizes via torch.xpu.synchronize()
 }
 
@@ -561,3 +572,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.attr("N") = GN;
     m.attr("K") = GK;
 }
+
+#else
+// Standalone executable (CONFIG=standalone): main() lives in the harness.
+#include "bf16_gemm_harness.impl"
+#endif  // TORCH_COMPILE

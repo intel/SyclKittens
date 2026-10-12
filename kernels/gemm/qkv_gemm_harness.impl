@@ -1,0 +1,106 @@
+// Standalone harness for qkv_gemm.dp.cpp (CONFIG=standalone, no PyTorch).
+// Included at the end of qkv_gemm.dp.cpp when TORCH_COMPILE is not defined,
+// so GK/GN/NQ/NK/NV, BM and launch_qkv<>() are already in scope.
+//
+//   usage: qkv_gemm [iters=100] [warmup=10]
+//   pick the GPU with ONEAPI_DEVICE_SELECTOR / ZE_AFFINITY_MASK.
+
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <vector>
+
+// Deterministic values in [-1, 1) so the run is reproducible.
+static float lcg_uniform(uint32_t &state) {
+    state = state * 1664525u + 1013904223u;
+    return static_cast<float>(state >> 8) / static_cast<float>(1u << 23) - 1.0f;
+}
+
+// rel-L2 over 256 sampled outputs vs an fp32 host reference. out(r, c) reads the
+// result for fused column c (0..GN), so the same check covers both output forms.
+template <typename Out>
+static double sampled_rel_l2(const std::vector<bf16> &a, const std::vector<bf16> &b, int M, Out out) {
+    double err2 = 0.0, ref2 = 0.0;
+    for (int s = 0; s < 256; s++) {
+        const int r = int((size_t(s) * 7919) % M), c = int((size_t(s) * 104729) % GN);
+        double ref = 0.0;
+        for (int k = 0; k < GK; k++)
+            ref += double(float(a[size_t(r) * GK + k])) * double(float(b[size_t(k) * GN + c]));
+        const double d = double(out(r, c)) - ref;
+        err2 += d * d;
+        ref2 += ref * ref;
+    }
+    return std::sqrt(err2 / (ref2 + 1e-30));
+}
+
+int main(int argc, char **argv) {
+    const int iters  = argc > 1 ? std::atoi(argv[1]) : 100;
+    const int warmup = argc > 2 ? std::atoi(argv[2]) : 10;
+
+    sycl::queue queue{sycl::gpu_selector_v, sycl::property::queue::in_order{}};
+    std::printf("Device: %s\n",
+                queue.get_device().get_info<sycl::info::device::name>().c_str());
+
+    std::vector<bf16> h_b(size_t(GK) * GN);
+    uint32_t seed = 12345u;
+    for (auto &x : h_b) x = bf16(lcg_uniform(seed) * 0.05f);
+    bf16 *d_b = sycl::malloc_device<bf16>(h_b.size(), queue);
+    queue.memcpy(d_b, h_b.data(), h_b.size() * sizeof(bf16)).wait();
+
+    bool all_pass = true;
+    for (int M : {512, 2048}) {
+        if (M % BM != 0) { std::printf("skip M=%d (not a multiple of BM=%d)\n", M, BM); continue; }
+        std::vector<bf16> h_a(size_t(M) * GK);
+        for (auto &x : h_a) x = bf16(lcg_uniform(seed));
+        bf16 *d_a = sycl::malloc_device<bf16>(h_a.size(), queue);
+        bf16 *d_c = sycl::malloc_device<bf16>(size_t(M) * GN, queue);
+        bf16 *d_q = sycl::malloc_device<bf16>(size_t(M) * NQ, queue);
+        bf16 *d_k = sycl::malloc_device<bf16>(size_t(M) * NK, queue);
+        bf16 *d_v = sycl::malloc_device<bf16>(size_t(M) * NV, queue);
+        queue.memcpy(d_a, h_a.data(), h_a.size() * sizeof(bf16)).wait();
+
+        for (int split = 0; split < 2; split++) {
+            auto run = [&] {
+                if (split) launch_qkv<true>(d_a, d_b, nullptr, d_q, d_k, d_v, M, queue);
+                else       launch_qkv<false>(d_a, d_b, d_c, d_c, d_c, d_c, M, queue);
+            };
+            for (int i = 0; i < warmup; i++) run();
+            queue.wait();
+            const auto t0 = std::chrono::high_resolution_clock::now();
+            for (int i = 0; i < iters; i++) run();
+            queue.wait();
+            const auto t1 = std::chrono::high_resolution_clock::now();
+            const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / iters;
+            const double tflops = 2.0 * M * GN * GK / (ms * 1e-3) / 1e12;
+
+            double rel;
+            if (split) {
+                std::vector<bf16> hq(size_t(M) * NQ), hk(size_t(M) * NK), hv(size_t(M) * NV);
+                queue.memcpy(hq.data(), d_q, hq.size() * sizeof(bf16));
+                queue.memcpy(hk.data(), d_k, hk.size() * sizeof(bf16));
+                queue.memcpy(hv.data(), d_v, hv.size() * sizeof(bf16));
+                queue.wait();
+                rel = sampled_rel_l2(h_a, h_b, M, [&](int r, int c) -> float {
+                    if (c < NQ)      return float(hq[size_t(r) * NQ + c]);
+                    if (c < NQ + NK) return float(hk[size_t(r) * NK + (c - NQ)]);
+                    return float(hv[size_t(r) * NV + (c - NQ - NK)]);
+                });
+            } else {
+                std::vector<bf16> hc(size_t(M) * GN);
+                queue.memcpy(hc.data(), d_c, hc.size() * sizeof(bf16)).wait();
+                rel = sampled_rel_l2(h_a, h_b, M, [&](int r, int c) { return float(hc[size_t(r) * GN + c]); });
+            }
+            const bool pass = rel < 1e-2;
+            all_pass &= pass;
+            std::printf("qkv_gemm %s M=%d K=%d N=%d (q %d k %d v %d): %.4f ms  %.1f TFLOP/s  "
+                        "(iters=%d warmup=%d)  rel_l2=%.2e  %s\n",
+                        split ? "split" : "fused", M, GK, GN, NQ, NK, NV, ms, tflops,
+                        iters, warmup, rel, pass ? "PASS" : "FAIL");
+        }
+        sycl::free(d_a, queue); sycl::free(d_c, queue);
+        sycl::free(d_q, queue); sycl::free(d_k, queue); sycl::free(d_v, queue);
+    }
+    sycl::free(d_b, queue);
+    return all_pass ? 0 : 1;
+}

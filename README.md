@@ -14,7 +14,7 @@ Paper: [SyclKittens: A Tile Programming Model for Programmers and Coding Agents 
 - Intel oneAPI DPC++ compiler with `icpx` and SYCL 2020 support
 - Intel Data Center GPU Max (PVC) for the supplied AOT target
 - C++20
-- XPU-enabled PyTorch and pybind11 for Python extension kernels
+- XPU-enabled PyTorch and pybind11 for Python extension kernels (`CONFIG=pytorch`)
 - oneMKL for the decode GEMV fallback
 - Level Zero development headers for the direct-copy all-gather and distributed
   GEMM targets; set
@@ -78,10 +78,36 @@ make -C kernels/collective all_reduce
 make -C kernels/context_attention ring_overlap
 ```
 
-Python extension targets use `PYTHON` to select an XPU-enabled environment:
+### Build modes
+
+Each kernel in `attention`, `gemm`, `norm`, `rotary`, `activation`, and `decode`
+builds in one of two modes, selected with `CONFIG`:
+
+| `CONFIG` | Output | Needs |
+|---|---|---|
+| `standalone` (default) | executable; `main()` comes from `<kernel>_harness.impl` | SYCL only |
+| `pytorch` | Python extension (`sk_<kernel>*.so`) | XPU PyTorch + pybind11 |
+
+A standalone run times the kernel and checks it against a CPU fp32 reference;
+arguments are `[iters] [warmup]`, and the exit code is non-zero on failure:
 
 ```bash
-make -C kernels/norm all \
+make -C kernels/attention forward
+./kernels/attention/build/gqa_forward 100 10
+```
+
+To build and run every standalone harness at once (summary at the end, non-zero
+exit on any failure):
+
+```bash
+./kernels/run_standalone.sh [iters] [warmup]
+```
+
+Python extension targets use `CONFIG=pytorch` and `PYTHON` to select an
+XPU-enabled environment:
+
+```bash
+make -C kernels/norm all CONFIG=pytorch \
   PYTHON=/path/to/xpu/python3 RMSNORM_D=4096 LN_D=4096
 ```
 

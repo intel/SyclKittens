@@ -36,10 +36,6 @@
 
 #include "kittens.dp.hpp"
 #include "ops/warp/register/tile/conversions.dp.hpp"
-#include "pyutils/torch_helpers.dp.hpp"
-
-#include <torch/extension.h>
-#include <c10/xpu/XPUStream.h>
 
 using namespace kittens;
 
@@ -467,6 +463,35 @@ static inline void route_fwd(sycl::queue &queue,
 #undef FWD_ROUTE
 }
 
+// ============================================================
+// Shared raw-pointer entry (both builds). Q,K,V: bf16 BNHD. O: bf16 (o_bf16)
+// or f32 BNHD. L: f32 [B,H,N] logsumexp. Enqueues only; the caller syncs.
+// ============================================================
+static void run_fwd(sycl::queue &queue, bf16 *d_Q, bf16 *d_K, bf16 *d_V,
+                    void *d_O, bool o_bf16, float *d_L, int B, int N,
+                    bool is_causal) {
+  global_layout<ATTN_D> Qg(d_Q, B, N, ATTN_H,    nullptr);
+  global_layout<ATTN_D> Kg(d_K, B, N, ATTN_H_KV, nullptr);
+  global_layout<ATTN_D> Vg(d_V, B, N, ATTN_H_KV, nullptr);
+
+  // bf16 output (E2E inference): the store epilogue converts the float softmax
+  // accumulators -> bf16 in-register, so the composed path no longer needs a
+  // separate f32->bf16 elementwise cast (+ HBM round-trip) per decoder layer.
+  // f32 output (training / bwd recompute) keeps the exact legacy behaviour.
+  if (o_bf16) {
+    global_layout_outh<ATTN_D> Og(static_cast<bf16 *>(d_O), B, N, ATTN_H, nullptr);
+    route_fwd(queue, Qg, Kg, Vg, Og, d_L, B, ATTN_H, N, is_causal);
+  } else {
+    global_layout_out<ATTN_D> Og(static_cast<float *>(d_O), B, N, ATTN_H, nullptr);
+    route_fwd(queue, Qg, Kg, Vg, Og, d_L, B, ATTN_H, N, is_causal);
+  }
+}
+
+#ifdef TORCH_COMPILE
+#include "pyutils/torch_helpers.dp.hpp"
+#include <torch/extension.h>
+#include <c10/xpu/XPUStream.h>
+
 void dispatch_fwd(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
                   torch::Tensor O, torch::Tensor L, bool is_causal) {
   CHECK_INPUT(Q); CHECK_INPUT(K); CHECK_INPUT(V);
@@ -490,27 +515,12 @@ void dispatch_fwd(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
   auto &queue = stream.queue();
   queue.wait();
 
-  bf16  *d_Q = reinterpret_cast<bf16*>(Q.data_ptr<c10::BFloat16>());
-  bf16  *d_K = reinterpret_cast<bf16*>(K.data_ptr<c10::BFloat16>());
-  bf16  *d_V = reinterpret_cast<bf16*>(V.data_ptr<c10::BFloat16>());
-  float *d_L = L.data_ptr<float>();
-
-  global_layout<ATTN_D> Qg(d_Q, B, N, H,    nullptr);
-  global_layout<ATTN_D> Kg(d_K, B, N, H_KV, nullptr);
-  global_layout<ATTN_D> Vg(d_V, B, N, H_KV, nullptr);
-
-  // bf16 output (E2E inference): the store epilogue converts the float softmax
-  // accumulators -> bf16 in-register, so the composed path no longer needs a
-  // separate f32->bf16 elementwise cast (+ HBM round-trip) per decoder layer.
-  // f32 output (training / bwd recompute) keeps the exact legacy behaviour.
-  if (O.dtype() == torch::kBFloat16) {
-    global_layout_outh<ATTN_D> Og(
-        reinterpret_cast<bf16*>(O.data_ptr<c10::BFloat16>()), B, N, H, nullptr);
-    route_fwd(queue, Qg, Kg, Vg, Og, d_L, B, H, N, is_causal);
-  } else {
-    global_layout_out<ATTN_D> Og(O.data_ptr<float>(), B, N, H, nullptr);
-    route_fwd(queue, Qg, Kg, Vg, Og, d_L, B, H, N, is_causal);
-  }
+  run_fwd(queue,
+          reinterpret_cast<bf16*>(Q.data_ptr<c10::BFloat16>()),
+          reinterpret_cast<bf16*>(K.data_ptr<c10::BFloat16>()),
+          reinterpret_cast<bf16*>(V.data_ptr<c10::BFloat16>()),
+          O.data_ptr(), O.dtype() == torch::kBFloat16, L.data_ptr<float>(),
+          B, N, is_causal);
 }
 
 // ============================================================
@@ -524,3 +534,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("O"), py::arg("L"),
         py::arg("is_causal") = true);
 }
+
+#else
+// Standalone executable (CONFIG=standalone): main() lives in the harness.
+#include "gqa_forward_harness.impl"
+#endif  // TORCH_COMPILE

@@ -1,0 +1,78 @@
+// Standalone harness for silu_mul.dp.cpp (CONFIG=standalone, no PyTorch).
+// Included at the end of silu_mul.dp.cpp when TORCH_COMPILE is not defined,
+// so bf16_t and launch_silu_mul() are already in scope.
+//
+//   usage: silu_mul [iters=100] [warmup=10]
+//   pick the GPU with ONEAPI_DEVICE_SELECTOR / ZE_AFFINITY_MASK.
+
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
+
+// Deterministic values in [-4, 4) so the run is reproducible.
+static float lcg_uniform(uint32_t &state) {
+    state = state * 1664525u + 1013904223u;
+    return (static_cast<float>(state >> 8) / static_cast<float>(1u << 23) - 1.0f) * 4.0f;
+}
+
+static uint16_t to_bits(float f) { return sycl::bit_cast<uint16_t>(bf16_t(f)); }
+static float from_bits(uint16_t b) { return static_cast<float>(sycl::bit_cast<bf16_t>(b)); }
+
+int main(int argc, char **argv) {
+    const int iters  = argc > 1 ? std::atoi(argv[1]) : 100;
+    const int warmup = argc > 2 ? std::atoi(argv[2]) : 10;
+    constexpr int INTER = 14336;
+
+    sycl::queue queue{sycl::gpu_selector_v, sycl::property::queue::in_order{}};
+    std::printf("Device: %s\n",
+                queue.get_device().get_info<sycl::info::device::name>().c_str());
+
+    bool all_pass = true;
+    for (int T : {1, 2048, 8192}) {
+        const size_t total = size_t(T) * INTER;
+        std::vector<uint16_t> h_gate(total), h_up(total), h_out(total);
+        uint32_t seed = 12345u + T;
+        for (auto &x : h_gate) x = to_bits(lcg_uniform(seed));
+        for (auto &x : h_up)   x = to_bits(lcg_uniform(seed));
+
+        uint16_t *d_gate = sycl::malloc_device<uint16_t>(total, queue);
+        uint16_t *d_up   = sycl::malloc_device<uint16_t>(total, queue);
+        uint16_t *d_out  = sycl::malloc_device<uint16_t>(total, queue);
+        queue.memcpy(d_gate, h_gate.data(), total * sizeof(uint16_t));
+        queue.memcpy(d_up, h_up.data(), total * sizeof(uint16_t));
+        queue.wait();
+
+        for (int i = 0; i < warmup; i++) launch_silu_mul(queue, d_gate, d_up, d_out, total);
+        queue.wait();
+        const auto t0 = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < iters; i++) launch_silu_mul(queue, d_gate, d_up, d_out, total);
+        queue.wait();
+        const auto t1 = std::chrono::high_resolution_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / iters;
+        const double gbps = 3.0 * total * sizeof(uint16_t) / (ms * 1e-3) / 1e9;   // r gate, r up, w out
+
+        // Full CPU reference (fp32 math on the bf16 inputs).
+        queue.memcpy(h_out.data(), d_out, total * sizeof(uint16_t)).wait();
+        double err2 = 0.0, ref2 = 0.0;
+        for (size_t i = 0; i < total; i++) {
+            const float g = from_bits(h_gate[i]), u = from_bits(h_up[i]);
+            const double ref = double(g / (1.0f + std::exp(-g)) * u);
+            const double d = double(from_bits(h_out[i])) - ref;
+            err2 += d * d;
+            ref2 += ref * ref;
+        }
+        const double rel = std::sqrt(err2 / (ref2 + 1e-30));
+        const bool pass = rel < 1e-2;
+        all_pass &= pass;
+        std::printf("silu_mul T=%d inter=%d: %.4f ms  %.1f GB/s  (iters=%d warmup=%d)  rel_l2=%.2e  %s\n",
+                    T, INTER, ms, gbps, iters, warmup, rel, pass ? "PASS" : "FAIL");
+
+        sycl::free(d_gate, queue);
+        sycl::free(d_up, queue);
+        sycl::free(d_out, queue);
+    }
+    return all_pass ? 0 : 1;
+}

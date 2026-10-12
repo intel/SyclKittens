@@ -27,9 +27,6 @@
 #include "kittens.dp.hpp"
 #pragma clang diagnostic pop
 
-#include "pyutils/torch_helpers.dp.hpp"
-#include <torch/extension.h>
-#include <c10/xpu/XPUStream.h>
 #include <tuple>
 
 #ifndef ROTARY_D
@@ -202,6 +199,11 @@ void launch_rotary_qk(
     queue.wait();
 }
 
+#ifdef TORCH_COMPILE
+#include "pyutils/torch_helpers.dp.hpp"
+#include <torch/extension.h>
+#include <c10/xpu/XPUStream.h>
+
 // ============================================================
 // PyTorch dispatch
 // ============================================================
@@ -307,3 +309,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "cos/sin (bf16 [N,D/2]) -> (dq_out, dk_out)",
           py::arg("dq"), py::arg("dk"), py::arg("cos"), py::arg("sin"));
 }
+
+#else
+// Standalone executable (CONFIG=standalone): main() lives in the harness.
+#include "rotary_qk_harness.impl"
+#endif  // TORCH_COMPILE

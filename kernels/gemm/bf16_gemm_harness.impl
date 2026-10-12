@@ -1,0 +1,79 @@
+// Standalone harness for bf16_gemm.dp.cpp (CONFIG=standalone, no PyTorch).
+// Included at the end of bf16_gemm.dp.cpp when TORCH_COMPILE is not defined,
+// so GM/GN/GK, _gl_C and run_gemm() are already in scope.
+//
+//   usage: bf16_gemm [iters=100] [warmup=10]
+//   pick the GPU with ONEAPI_DEVICE_SELECTOR / ZE_AFFINITY_MASK.
+
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
+
+using c_type = typename _gl_C::dtype;
+
+// Deterministic values in [-1, 1) so the run is reproducible.
+static float lcg_uniform(uint32_t &state) {
+    state = state * 1664525u + 1013904223u;
+    return static_cast<float>(state >> 8) / static_cast<float>(1u << 23) - 1.0f;
+}
+
+int main(int argc, char **argv) {
+    const int iters  = argc > 1 ? std::atoi(argv[1]) : 100;
+    const int warmup = argc > 2 ? std::atoi(argv[2]) : 10;
+
+    sycl::queue queue{sycl::gpu_selector_v, sycl::property::queue::in_order{}};
+    std::printf("Device: %s\n",
+                queue.get_device().get_info<sycl::info::device::name>().c_str());
+
+    const size_t size_a = size_t(GM) * GK, size_b = size_t(GK) * GN, size_c = size_t(GM) * GN;
+    std::vector<bf16> h_a(size_a), h_b(size_b);
+    uint32_t seed = 12345u;
+    for (auto &x : h_a) x = bf16(lcg_uniform(seed));
+    for (auto &x : h_b) x = bf16(lcg_uniform(seed));
+
+    bf16   *d_a = sycl::malloc_device<bf16>(size_a, queue);
+    bf16   *d_b = sycl::malloc_device<bf16>(size_b, queue);
+    c_type *d_c = sycl::malloc_device<c_type>(size_c, queue);
+    queue.memcpy(d_a, h_a.data(), size_a * sizeof(bf16));
+    queue.memcpy(d_b, h_b.data(), size_b * sizeof(bf16));
+    queue.wait();
+
+    for (int i = 0; i < warmup; i++) run_gemm(d_a, d_b, d_c, queue);
+    queue.wait();
+
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < iters; i++) run_gemm(d_a, d_b, d_c, queue);
+    queue.wait();
+    const auto t1 = std::chrono::high_resolution_clock::now();
+    const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / iters;
+    const double tflops = 2.0 * GM * GN * GK / (ms * 1e-3) / 1e12;
+
+    // Correctness: rel-L2 over 256 sampled outputs against an fp32 host reference.
+    std::vector<c_type> h_c(size_c);
+    queue.memcpy(h_c.data(), d_c, size_c * sizeof(c_type)).wait();
+    double err2 = 0.0, ref2 = 0.0;
+    for (int s = 0; s < 256; s++) {
+        const int r = int((size_t(s) * 7919) % GM), c = int((size_t(s) * 104729) % GN);
+        double ref = 0.0;
+        for (int k = 0; k < GK; k++)
+            ref += double(float(h_a[size_t(r) * GK + k])) * double(float(h_b[size_t(k) * GN + c]));
+        const double got = double(float(h_c[size_t(r) * GN + c]));
+        err2 += (got - ref) * (got - ref);
+        ref2 += ref * ref;
+    }
+    const double rel = std::sqrt(err2 / (ref2 + 1e-30));
+    const bool pass = rel < 1e-2;
+
+    std::printf("GEMM %dx%dx%d (bf16 in, %s out): %.3f ms  %.1f TFLOP/s  "
+                "(iters=%d warmup=%d)  rel_l2=%.2e  %s\n",
+                GM, GN, GK, sizeof(c_type) == 4 ? "fp32" : "bf16", ms, tflops,
+                iters, warmup, rel, pass ? "PASS" : "FAIL");
+
+    sycl::free(d_a, queue);
+    sycl::free(d_b, queue);
+    sycl::free(d_c, queue);
+    return pass ? 0 : 1;
+}

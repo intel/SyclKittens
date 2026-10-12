@@ -27,10 +27,6 @@
 #include "kittens.dp.hpp"
 #pragma clang diagnostic pop
 
-#include "pyutils/torch_helpers.dp.hpp"
-#include <torch/extension.h>
-#include <c10/xpu/XPUStream.h>
-
 #ifndef LN_D
 #define LN_D 4096
 #endif
@@ -177,9 +173,14 @@ void launch_layernorm_v6(
     });
 }
 
+#ifdef TORCH_COMPILE
 // ============================================================
 // PyTorch dispatch functions
 // ============================================================
+
+#include "pyutils/torch_helpers.dp.hpp"
+#include <torch/extension.h>
+#include <c10/xpu/XPUStream.h>
 
 torch::Tensor dispatch_layernorm(
     torch::Tensor x, torch::Tensor weight, torch::Tensor bias) {
@@ -251,3 +252,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Fused Add+LayerNorm: (x + residual) -> LN, residual_out",
           py::arg("x"), py::arg("residual"), py::arg("weight"), py::arg("bias"));
 }
+
+#else
+// Standalone executable (CONFIG=standalone): main() lives in the harness.
+#include "layernorm_harness.impl"
+#endif  // TORCH_COMPILE
