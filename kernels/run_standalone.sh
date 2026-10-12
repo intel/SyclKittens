@@ -22,23 +22,26 @@ BINS="gemm/bf16_gemm_4096x4096x4096 gemm/qkv_gemm attention/gqa_forward attentio
       activation/silu_mul decode/decode"
 
 echo "== build (CONFIG=standalone), logs in <dir>/build/standalone.log"
+declare -A pid
 for d in $DIRS; do
-    ( mkdir -p "$d/build"
-      make -C "$d" all CONFIG=standalone ${MAKE_ARGS:-} > "$d/build/standalone.log" 2>&1 ) &
+    mkdir -p "$d/build"
+    make -C "$d" all CONFIG=standalone ${MAKE_ARGS:-} > "$d/build/standalone.log" 2>&1 &
+    pid[$d]=$!
 done
-wait
-build_fail=0
+build_fail=0; broken=" "
 for d in $DIRS; do
-    if grep -q -E "Error [0-9]|error:" "$d/build/standalone.log"; then
-        echo "   $d: BUILD FAILED (see $d/build/standalone.log)"; build_fail=1
+    if ! wait "${pid[$d]}"; then
+        echo "   $d: BUILD FAILED (see $d/build/standalone.log)"
+        build_fail=1; broken="$broken$d "
     fi
 done
 
 echo "== run (iters=$ITERS warmup=$WARMUP)"
 pass=0; fail=0; failed=""
 for b in $BINS; do
-    exe="${b%%/*}/build/${b#*/}"
-    if [ ! -x "$exe" ]; then
+    d="${b%%/*}"; exe="$d/build/${b#*/}"
+    # Never run an executable left over from an earlier build of a failed directory.
+    if [[ "$broken" == *" $d "* ]] || [ ! -x "$exe" ]; then
         echo "-- $b: not built"; fail=$((fail + 1)); failed="$failed $b"; continue
     fi
     out=$("./$exe" "$ITERS" "$WARMUP" 2>&1); rc=$?
