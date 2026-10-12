@@ -1,6 +1,3 @@
-# Decode is bandwidth-bound: 256 GRF halves the threads per XVE and costs 7-11%
-# per token on B70, so keep 128 GRF unless LARGE_GRF=1 is passed explicitly.
-LARGE_GRF ?= 0
 include ../common.mk
 
 .PHONY: all decode
