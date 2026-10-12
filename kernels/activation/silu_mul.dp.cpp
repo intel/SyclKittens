@@ -28,10 +28,6 @@
 
 #include <sycl/sycl.hpp>
 
-#include "pyutils/torch_helpers.dp.hpp"
-#include <torch/extension.h>
-#include <c10/xpu/XPUStream.h>
-
 #ifndef SILU_VEC
 #define SILU_VEC 8
 #endif
@@ -111,9 +107,14 @@ void launch_silu_mul(
     // NO queue.wait() — caller synchronizes via torch.xpu.synchronize()
 }
 
+#ifdef TORCH_COMPILE
 // ============================================================
 // PyTorch dispatch
 // ============================================================
+
+#include "pyutils/torch_helpers.dp.hpp"
+#include <torch/extension.h>
+#include <c10/xpu/XPUStream.h>
 
 torch::Tensor dispatch_silu_mul(
     torch::Tensor gate,   // (B, N, inter), bf16
@@ -153,3 +154,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Fused SiLU*mul: gate,up (bf16 [B,N,inter]) -> out (bf16 [B,N,inter])",
           py::arg("gate"), py::arg("up"));
 }
+
+#else
+// Standalone executable (CONFIG=standalone): main() lives in the harness.
+#include "silu_mul_harness.impl"
+#endif  // TORCH_COMPILE

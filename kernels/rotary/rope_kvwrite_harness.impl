@@ -1,0 +1,120 @@
+// Standalone harness for rope_kvwrite.dp.cpp (CONFIG=standalone, no PyTorch).
+// Included at the end of rope_kvwrite.dp.cpp when TORCH_COMPILE is not defined,
+// so ROTARY_D and launch_rope_kvwrite() are already in scope.
+//
+//   usage: rope_kvwrite [iters=100] [warmup=10]
+//   pick the GPU with ONEAPI_DEVICE_SELECTOR / ZE_AFFINITY_MASK.
+
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
+
+// Deterministic values in [-1, 1) so the run is reproducible.
+static float lcg_uniform(uint32_t &state) {
+    state = state * 1664525u + 1013904223u;
+    return static_cast<float>(state >> 8) / static_cast<float>(1u << 23) - 1.0f;
+}
+
+// k, v: (B, N, H, D); caches: (B, H, S, D) with S = cache_pos + N + 16 (slack rows
+// must stay untouched). Checks rotated K, copied V, and the untouched cache rows.
+static bool run_case(sycl::queue &queue, int B, int N, int H, long cache_pos,
+                     int iters, int warmup) {
+    constexpr int D = ROTARY_D, HALF = D / 2;
+    const long S = cache_pos + N + 16;
+    const size_t nx = size_t(B) * N * H * D, ncs = size_t(N) * HALF, nc = size_t(B) * H * S * D;
+    const bf16 sentinel = bf16(7.0f);   // outside the [-2, 2] range any written value can take
+
+    uint32_t seed = 777u + uint32_t(N) * 7u;
+    std::vector<bf16> h_k(nx), h_v(nx), h_cos(ncs), h_sin(ncs), h_kc(nc), h_vc(nc);
+    for (auto &x : h_k) x = bf16(lcg_uniform(seed));
+    for (auto &x : h_v) x = bf16(lcg_uniform(seed));
+    for (size_t i = 0; i < ncs; i++) {
+        const float ang = 3.14159265f * lcg_uniform(seed);
+        h_cos[i] = bf16(std::cos(ang));
+        h_sin[i] = bf16(std::sin(ang));
+    }
+
+    bf16 *d_k  = sycl::malloc_device<bf16>(nx, queue);
+    bf16 *d_v  = sycl::malloc_device<bf16>(nx, queue);
+    bf16 *d_cos = sycl::malloc_device<bf16>(ncs, queue);
+    bf16 *d_sin = sycl::malloc_device<bf16>(ncs, queue);
+    bf16 *d_kc = sycl::malloc_device<bf16>(nc, queue);
+    bf16 *d_vc = sycl::malloc_device<bf16>(nc, queue);
+    queue.memcpy(d_k, h_k.data(), nx * sizeof(bf16));
+    queue.memcpy(d_v, h_v.data(), nx * sizeof(bf16));
+    queue.memcpy(d_cos, h_cos.data(), ncs * sizeof(bf16));
+    queue.memcpy(d_sin, h_sin.data(), ncs * sizeof(bf16));
+    queue.fill(d_kc, sentinel, nc);
+    queue.fill(d_vc, sentinel, nc);
+    queue.wait();
+
+    // The kernel is idempotent for fixed inputs, so repeated launches keep the same cache.
+    auto launch = [&] {
+        launch_rope_kvwrite<D>(queue, d_k, d_v, d_cos, d_sin, d_kc, d_vc, B, N, H, S, S, cache_pos);
+    };
+    for (int i = 0; i < warmup; i++) launch();
+    queue.wait();
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < iters; i++) launch();
+    queue.wait();
+    const auto t1 = std::chrono::high_resolution_clock::now();
+    const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / iters;
+    const double bytes = 4.0 * nx * sizeof(bf16) + 2.0 * ncs * sizeof(bf16);   // read k,v + write both caches
+
+    queue.memcpy(h_kc.data(), d_kc, nc * sizeof(bf16));
+    queue.memcpy(h_vc.data(), d_vc, nc * sizeof(bf16));
+    queue.wait();
+    double max_err = 0.0;
+    long untouched_bad = 0;
+    for (int b = 0; b < B; b++)
+        for (int h = 0; h < H; h++)
+            for (long s = 0; s < S; s++) {
+                const size_t c_off = ((size_t(b) * H + h) * S + s) * D;
+                const long n = s - cache_pos;
+                if (n < 0 || n >= N) {   // rows outside [cache_pos, cache_pos + N) must be untouched
+                    for (int d = 0; d < D; d++)
+                        untouched_bad += (float(h_kc[c_off + d]) != float(sentinel)) +
+                                         (float(h_vc[c_off + d]) != float(sentinel));
+                    continue;
+                }
+                const size_t x_off = ((size_t(b) * N + n) * H + h) * D;
+                for (int d = 0; d < HALF; d++) {
+                    const float a = float(h_k[x_off + d]), bb = float(h_k[x_off + HALF + d]);
+                    const float c = float(h_cos[size_t(n) * HALF + d]), sn = float(h_sin[size_t(n) * HALF + d]);
+                    const double r1 = a * c - bb * sn, r2 = bb * c + a * sn;
+                    max_err = std::fmax(max_err, std::fabs(double(float(h_kc[c_off + d])) - r1));
+                    max_err = std::fmax(max_err, std::fabs(double(float(h_kc[c_off + HALF + d])) - r2));
+                }
+                for (int d = 0; d < D; d++)   // V is a raw copy: must be bit-exact
+                    max_err = std::fmax(max_err, std::fabs(double(float(h_vc[c_off + d])) -
+                                                           double(float(h_v[x_off + d]))));
+            }
+    const bool pass = max_err <= 1e-2 && untouched_bad == 0;
+    std::printf("rope_kvwrite B=%d T=%d H=%d D=%d S=%ld pos=%ld: %.4f ms  %.1f GB/s  "
+                "max_err=%.2e  untouched_bad=%ld  %s\n",
+                B, N, H, D, S, cache_pos, ms, bytes / (ms * 1e-3) / 1e9, max_err, untouched_bad,
+                pass ? "PASS" : "FAIL");
+
+    sycl::free(d_k, queue); sycl::free(d_v, queue);
+    sycl::free(d_cos, queue); sycl::free(d_sin, queue);
+    sycl::free(d_kc, queue); sycl::free(d_vc, queue);
+    return pass;
+}
+
+int main(int argc, char **argv) {
+    const int iters  = argc > 1 ? std::atoi(argv[1]) : 100;
+    const int warmup = argc > 2 ? std::atoi(argv[2]) : 10;
+
+    sycl::queue queue{sycl::gpu_selector_v, sycl::property::queue::in_order{}};
+    std::printf("Device: %s  (iters=%d warmup=%d)\n",
+                queue.get_device().get_info<sycl::info::device::name>().c_str(), iters, warmup);
+
+    bool ok = true;
+    // T=1 at a nonzero cache position (decode step), T=2048 from position 0 (prefill).
+    ok &= run_case(queue, /*B=*/1, /*T=*/1,    /*H=*/8, /*cache_pos=*/100, iters, warmup);
+    ok &= run_case(queue, /*B=*/1, /*T=*/2048, /*H=*/8, /*cache_pos=*/0,   iters, warmup);
+    return ok ? 0 : 1;
+}

@@ -19,8 +19,10 @@
  * at the end. Kernels are simple (decode is memory-bound; correctness > peak).
  */
 
+#ifdef TORCH_COMPILE
 #include <torch/extension.h>
 #include <c10/xpu/XPUStream.h>
+#endif
 
 #include <sycl/sycl.hpp>
 #include <vector>
@@ -29,9 +31,15 @@
 
 using sbf16 = sycl::ext::oneapi::bfloat16;
 
+#ifdef TORCH_COMPILE
 static inline sycl::queue &tq(int d) {
     return c10::xpu::getCurrentXPUStream(d).queue();
 }
+#else
+// Standalone build: the harness owns one in-order queue per tile.
+static std::vector<sycl::queue> g_queues;
+static inline sycl::queue &tq(int d) { return g_queues[d]; }
+#endif
 
 struct PtrPack { sbf16 *p[12]; };
 
@@ -369,28 +377,10 @@ struct LayerW {
 };
 static std::vector<LayerW> g_layers;
 
-static void register_layer(int li, int nl,
-    std::vector<torch::Tensor> norm_in, std::vector<torch::Tensor> Wqkv,
-    std::vector<torch::Tensor> Wo, std::vector<torch::Tensor> norm_post,
-    std::vector<torch::Tensor> Wgate, std::vector<torch::Tensor> Wup,
-    std::vector<torch::Tensor> Wdown, std::vector<torch::Tensor> kcache,
-    std::vector<torch::Tensor> vcache)
-{
+// Store one layer's per-tile weight / KV pointers (raw-pointer core of register_layer).
+static void set_layer(int li, int nl, const LayerW &lw) {
     if ((int)g_layers.size() != nl) g_layers.assign(nl, LayerW{});
-    const int N = g_ctx.n_gpus;
-    LayerW &lw = g_layers[li];
-    for (int d = 0; d < N; d++) {
-        lw.norm_in[d]   = reinterpret_cast<sbf16*>(norm_in[d].data_ptr());
-        lw.Wqkv[d]      = reinterpret_cast<sbf16*>(Wqkv[d].data_ptr());
-        lw.Wo[d]        = reinterpret_cast<sbf16*>(Wo[d].data_ptr());
-        lw.norm_post[d] = reinterpret_cast<sbf16*>(norm_post[d].data_ptr());
-        lw.Wgate[d]     = reinterpret_cast<sbf16*>(Wgate[d].data_ptr());
-        lw.Wup[d]       = reinterpret_cast<sbf16*>(Wup[d].data_ptr());
-        lw.Wdown[d]     = reinterpret_cast<sbf16*>(Wdown[d].data_ptr());
-        lw.kc[d]        = reinterpret_cast<sbf16*>(kcache[d].data_ptr());
-        lw.vc[d]        = reinterpret_cast<sbf16*>(vcache[d].data_ptr());
-    }
-    lw.inter = Wgate[0].numel() / g_ctx.hidden;
+    g_layers[li] = lw;
 }
 
 static inline void do_layer(const LayerW &lw, sbf16 **xptr, sbf16 **cptr,
@@ -463,23 +453,18 @@ static inline void do_layer(const LayerW &lw, sbf16 **xptr, sbf16 **cptr,
 static sbf16 *g_xbuf[12], *g_cosbuf[12], *g_sinbuf[12];
 static bool g_io_registered = false;
 
-static void register_io(std::vector<torch::Tensor> xbuf,
-                        std::vector<torch::Tensor> cosbuf,
-                        std::vector<torch::Tensor> sinbuf) {
-    const int N = g_ctx.n_gpus;
-    for (int d = 0; d < N; d++) {
-        g_xbuf[d]   = reinterpret_cast<sbf16*>(xbuf[d].data_ptr());
-        g_cosbuf[d] = reinterpret_cast<sbf16*>(cosbuf[d].data_ptr());
-        g_sinbuf[d] = reinterpret_cast<sbf16*>(sinbuf[d].data_ptr());
+// Store the per-tile bf16 x / cos / sin buffers (raw-pointer core of register_io).
+static void set_io(sbf16 *const *x, sbf16 *const *cos, sbf16 *const *sin) {
+    for (int d = 0; d < g_ctx.n_gpus; d++) {
+        g_xbuf[d] = x[d]; g_cosbuf[d] = cos[d]; g_sinbuf[d] = sin[d];
     }
     g_io_registered = true;
 }
 
-static void decode_step(int pos, int nq, int nkv, double eps) {
-    TORCH_CHECK(g_ctx.initialized && !g_layers.empty() && g_io_registered,
-                "sk_decode: init / register_layer / register_io first");
+// One decode step through all registered layers (x updated in place). Enqueues only.
+static void run_layers(int pos, int nq, int nkv, float eps) {
     for (size_t li = 0; li < g_layers.size(); li++)
-        do_layer(g_layers[li], g_xbuf, g_cosbuf, g_sinbuf, pos, nq, nkv, (float)eps);
+        do_layer(g_layers[li], g_xbuf, g_cosbuf, g_sinbuf, pos, nq, nkv, eps);
 }
 
 // ============================================================
@@ -581,15 +566,13 @@ static inline void do_layer_2d(const LayerW &lw, sbf16 **xptr, sbf16 **cptr,
     }
 }
 
-static void decode_2d_step(int pos, int nq, int nkv, double eps) {
-    TORCH_CHECK(g_ctx.initialized && !g_layers.empty() && g_io_registered && g_tp > 0,
-                "sk_decode: init / register_layer / register_io / set_2d first");
+static void run_layers_2d(int pos, int nq, int nkv, float eps) {
     for (size_t li = 0; li < g_layers.size(); li++)
-        do_layer_2d(g_layers[li], g_xbuf, g_cosbuf, g_sinbuf, pos, nq, nkv, (float)eps);
+        do_layer_2d(g_layers[li], g_xbuf, g_cosbuf, g_sinbuf, pos, nq, nkv, eps);
 }
 static void py_set_2d(int tp, int cp) { g_tp = tp; g_cp = cp; }
 
-// ---- python interface ----
+// ---- setup / teardown (shared by both builds) ----
 static void py_init(int n_gpus, int hidden, int inter_max, int qkv_max,
                     int nq_max, int hd, int max_ctx) {
     g_ctx.init(n_gpus, hidden, inter_max, qkv_max, nq_max, hd, max_ctx);
@@ -597,6 +580,55 @@ static void py_init(int n_gpus, int hidden, int inter_max, int qkv_max,
 }
 static void py_cleanup() { g_ctx.cleanup(); g_layers.clear(); g_io_registered = false; }
 static bool py_is_initialized() { return g_ctx.initialized; }
+
+#ifdef TORCH_COMPILE
+// ---- python interface: tensors -> raw pointers, then the shared core ----
+static void register_layer(int li, int nl,
+    std::vector<torch::Tensor> norm_in, std::vector<torch::Tensor> Wqkv,
+    std::vector<torch::Tensor> Wo, std::vector<torch::Tensor> norm_post,
+    std::vector<torch::Tensor> Wgate, std::vector<torch::Tensor> Wup,
+    std::vector<torch::Tensor> Wdown, std::vector<torch::Tensor> kcache,
+    std::vector<torch::Tensor> vcache)
+{
+    LayerW lw{};
+    for (int d = 0; d < g_ctx.n_gpus; d++) {
+        lw.norm_in[d]   = reinterpret_cast<sbf16*>(norm_in[d].data_ptr());
+        lw.Wqkv[d]      = reinterpret_cast<sbf16*>(Wqkv[d].data_ptr());
+        lw.Wo[d]        = reinterpret_cast<sbf16*>(Wo[d].data_ptr());
+        lw.norm_post[d] = reinterpret_cast<sbf16*>(norm_post[d].data_ptr());
+        lw.Wgate[d]     = reinterpret_cast<sbf16*>(Wgate[d].data_ptr());
+        lw.Wup[d]       = reinterpret_cast<sbf16*>(Wup[d].data_ptr());
+        lw.Wdown[d]     = reinterpret_cast<sbf16*>(Wdown[d].data_ptr());
+        lw.kc[d]        = reinterpret_cast<sbf16*>(kcache[d].data_ptr());
+        lw.vc[d]        = reinterpret_cast<sbf16*>(vcache[d].data_ptr());
+    }
+    lw.inter = Wgate[0].numel() / g_ctx.hidden;
+    set_layer(li, nl, lw);
+}
+
+static void register_io(std::vector<torch::Tensor> xbuf,
+                        std::vector<torch::Tensor> cosbuf,
+                        std::vector<torch::Tensor> sinbuf) {
+    sbf16 *x[12], *c[12], *s[12];
+    for (int d = 0; d < g_ctx.n_gpus; d++) {
+        x[d] = reinterpret_cast<sbf16*>(xbuf[d].data_ptr());
+        c[d] = reinterpret_cast<sbf16*>(cosbuf[d].data_ptr());
+        s[d] = reinterpret_cast<sbf16*>(sinbuf[d].data_ptr());
+    }
+    set_io(x, c, s);
+}
+
+static void decode_step(int pos, int nq, int nkv, double eps) {
+    TORCH_CHECK(g_ctx.initialized && !g_layers.empty() && g_io_registered,
+                "sk_decode: init / register_layer / register_io first");
+    run_layers(pos, nq, nkv, (float)eps);
+}
+
+static void decode_2d_step(int pos, int nq, int nkv, double eps) {
+    TORCH_CHECK(g_ctx.initialized && !g_layers.empty() && g_io_registered && g_tp > 0,
+                "sk_decode: init / register_layer / register_io / set_2d first");
+    run_layers_2d(pos, nq, nkv, (float)eps);
+}
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "SyclKittens registered all-layer decode orchestrator";
@@ -627,3 +659,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("pos"), pybind11::arg("nq"), pybind11::arg("nkv"),
           pybind11::arg("eps"));
 }
+
+#else
+// Standalone executable (CONFIG=standalone): main() lives in the harness.
+#include "decode_harness.impl"
+#endif  // TORCH_COMPILE

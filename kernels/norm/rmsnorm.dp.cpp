@@ -23,10 +23,6 @@
 #include "kittens.dp.hpp"
 #pragma clang diagnostic pop
 
-#include "pyutils/torch_helpers.dp.hpp"
-#include <torch/extension.h>
-#include <c10/xpu/XPUStream.h>
-
 #ifndef RMSNORM_D
 #define RMSNORM_D 2048
 #endif
@@ -159,9 +155,14 @@ void launch_rmsnorm_v6(
     });
 }
 
+#ifdef TORCH_COMPILE
 // ============================================================
 // PyTorch dispatch functions
 // ============================================================
+
+#include "pyutils/torch_helpers.dp.hpp"
+#include <torch/extension.h>
+#include <c10/xpu/XPUStream.h>
 
 std::vector<torch::Tensor> dispatch_rmsnorm(
     torch::Tensor x, torch::Tensor weight, double eps) {
@@ -234,3 +235,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Fused add + RMSNorm: x,residual (bf16 [B,N,D]) -> (out, residual_out, inv_rms)",
           py::arg("x"), py::arg("residual"), py::arg("weight"), py::arg("eps"));
 }
+
+#else
+// Standalone executable (CONFIG=standalone): main() lives in the harness.
+#include "rmsnorm_harness.impl"
+#endif  // TORCH_COMPILE

@@ -213,6 +213,7 @@ static void launch_qkv(bf16 *d_A, bf16 *d_B,
     });
 }
 
+#ifdef TORCH_COMPILE
 // ============================================================
 // PyTorch dispatch
 // ============================================================
@@ -292,3 +293,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.attr("BM") = BM;
     m.attr("BN") = BN;
 }
+
+#else
+// Standalone executable (CONFIG=standalone): main() lives in the harness.
+#include "qkv_gemm_harness.impl"
+#endif  // TORCH_COMPILE

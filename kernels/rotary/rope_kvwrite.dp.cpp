@@ -33,9 +33,6 @@
 #include "kittens.dp.hpp"
 #pragma clang diagnostic pop
 
-#include "pyutils/torch_helpers.dp.hpp"
-#include <torch/extension.h>
-#include <c10/xpu/XPUStream.h>
 
 #ifndef ROTARY_D
 #define ROTARY_D 128
@@ -210,6 +207,11 @@ void launch_rope_kvwrite(
     queue.wait();
 }
 
+#ifdef TORCH_COMPILE
+#include "pyutils/torch_helpers.dp.hpp"
+#include <torch/extension.h>
+#include <c10/xpu/XPUStream.h>
+
 // ============================================================
 // PyTorch dispatch
 // ============================================================
@@ -281,3 +283,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("k"), py::arg("v"), py::arg("cos"), py::arg("sin"),
           py::arg("k_cache"), py::arg("v_cache"), py::arg("cache_pos"));
 }
+
+#else
+// Standalone executable (CONFIG=standalone): main() lives in the harness.
+#include "rope_kvwrite_harness.impl"
+#endif  // TORCH_COMPILE

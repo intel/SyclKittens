@@ -20,10 +20,6 @@
 #include "kittens.dp.hpp"
 #pragma clang diagnostic pop
 
-#include "pyutils/torch_helpers.dp.hpp"
-#include <torch/extension.h>
-#include <c10/xpu/XPUStream.h>
-
 #ifndef ROTARY_D
 #define ROTARY_D 128
 #endif
@@ -172,6 +168,11 @@ void launch_rotary(
     queue.wait();
 }
 
+#ifdef TORCH_COMPILE
+#include "pyutils/torch_helpers.dp.hpp"
+#include <torch/extension.h>
+#include <c10/xpu/XPUStream.h>
+
 // ============================================================
 // PyTorch dispatch
 // ============================================================
@@ -253,3 +254,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "RoPE backward: dy (bf16 [B,N,H,D]), cos/sin (bf16 [N,D/2]) -> dx",
           py::arg("dy"), py::arg("cos"), py::arg("sin"));
 }
+
+#else
+// Standalone executable (CONFIG=standalone): main() lives in the harness.
+#include "rotary_harness.impl"
+#endif  // TORCH_COMPILE

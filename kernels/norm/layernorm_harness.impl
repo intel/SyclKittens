@@ -1,0 +1,118 @@
+// Standalone harness for layernorm.dp.cpp (CONFIG=standalone, no PyTorch).
+// Included at the end of layernorm.dp.cpp when TORCH_COMPILE is not defined, so
+// LN_D, LN_EPS and launch_layernorm_v6() are already in scope.
+//
+//   usage: layernorm [iters=100] [warmup=10]
+//   pick the GPU with ONEAPI_DEVICE_SELECTOR / ZE_AFFINITY_MASK.
+
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
+
+// Deterministic values in [-1, 1) so the run is reproducible.
+static float lcg_uniform(uint32_t &state) {
+    state = state * 1664525u + 1013904223u;
+    return static_cast<float>(state >> 8) / static_cast<float>(1u << 23) - 1.0f;
+}
+
+static double rel_l2(const std::vector<bf16> &got, const std::vector<float> &ref) {
+    double err2 = 0.0, ref2 = 0.0;
+    for (size_t i = 0; i < ref.size(); i++) {
+        const double d = double(float(got[i])) - ref[i];
+        err2 += d * d;
+        ref2 += double(ref[i]) * ref[i];
+    }
+    return std::sqrt(err2 / (ref2 + 1e-30));
+}
+
+// One case: T tokens (B=1, N=T). FUSED adds the residual and writes it back.
+template <bool FUSED>
+static bool run_case(sycl::queue &q, int T, int iters, int warmup) {
+    constexpr int D = LN_D;
+    const size_t n = size_t(T) * D;
+
+    std::vector<bf16> h_x(n), h_r(n), h_g(D), h_b(D);
+    uint32_t seed = 54321u + T;
+    for (auto &v : h_x) v = bf16(lcg_uniform(seed));
+    for (auto &v : h_r) v = bf16(lcg_uniform(seed));
+    for (auto &v : h_g) v = bf16(1.0f + 0.1f * lcg_uniform(seed));
+    for (auto &v : h_b) v = bf16(0.1f * lcg_uniform(seed));
+
+    bf16 *d_x = sycl::malloc_device<bf16>(n, q), *d_r = sycl::malloc_device<bf16>(n, q);
+    bf16 *d_g = sycl::malloc_device<bf16>(D, q), *d_b = sycl::malloc_device<bf16>(D, q);
+    bf16 *d_o = sycl::malloc_device<bf16>(n, q), *d_or = sycl::malloc_device<bf16>(n, q);
+    q.memcpy(d_x, h_x.data(), n * sizeof(bf16));
+    q.memcpy(d_r, h_r.data(), n * sizeof(bf16));
+    q.memcpy(d_g, h_g.data(), D * sizeof(bf16));
+    q.memcpy(d_b, h_b.data(), D * sizeof(bf16));
+    q.wait();
+
+    auto launch = [&] {
+        launch_layernorm_v6<D, LN_WARPS_PER_ROW, FUSED, FUSED>(
+            q, d_x, FUSED ? d_r : nullptr, d_g, d_b, d_o, FUSED ? d_or : nullptr,
+            1, T, LN_EPS);
+    };
+    for (int i = 0; i < warmup; i++) launch();
+    q.wait();
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < iters; i++) launch();
+    q.wait();
+    const auto t1 = std::chrono::high_resolution_clock::now();
+    const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / iters;
+    // Compulsory traffic: read x (+residual), write out (+residual_out).
+    const double gbps = (FUSED ? 4.0 : 2.0) * n * sizeof(bf16) / (ms * 1e-3) / 1e9;
+
+    std::vector<bf16> h_o(n), h_or(n);
+    q.memcpy(h_o.data(), d_o, n * sizeof(bf16));
+    if (FUSED) q.memcpy(h_or.data(), d_or, n * sizeof(bf16));
+    q.wait();
+
+    // fp32 reference: h = x (+ r); out = (h - mean) * rsqrt(var + eps) * gamma + beta.
+    std::vector<float> ref_o(n), ref_h(n);
+    for (int t = 0; t < T; t++) {
+        const size_t base = size_t(t) * D;
+        double s = 0.0, ss = 0.0;
+        for (int d = 0; d < D; d++) {
+            float h = float(h_x[base + d]) + (FUSED ? float(h_r[base + d]) : 0.0f);
+            ref_h[base + d] = h;
+            s += h;
+            ss += double(h) * h;
+        }
+        const double mean = s / D, var = ss / D - mean * mean;
+        const float inv = float(1.0 / std::sqrt(var + LN_EPS));
+        for (int d = 0; d < D; d++)
+            ref_o[base + d] = (ref_h[base + d] - float(mean)) * inv * float(h_g[d]) + float(h_b[d]);
+    }
+    const double err = rel_l2(h_o, ref_o);
+    const double err_r = FUSED ? rel_l2(h_or, ref_h) : 0.0;
+    const bool pass = err < 1e-2 && err_r < 1e-2;
+
+    char resid[48] = "";
+    if (FUSED) std::snprintf(resid, sizeof(resid), "  resid_rel_l2=%.2e", err_r);
+    std::printf("layernorm%s T=%-5d D=%d: %8.4f ms  %7.1f GB/s  rel_l2=%.2e%s  %s\n",
+                FUSED ? "+residual" : "         ", T, D, ms, gbps, err, resid,
+                pass ? "PASS" : "FAIL");
+
+    for (void *p : {(void *)d_x, (void *)d_r, (void *)d_g, (void *)d_b, (void *)d_o, (void *)d_or})
+        sycl::free(p, q);
+    return pass;
+}
+
+int main(int argc, char **argv) {
+    const int iters  = argc > 1 ? std::atoi(argv[1]) : 100;
+    const int warmup = argc > 2 ? std::atoi(argv[2]) : 10;
+
+    sycl::queue q{sycl::gpu_selector_v, sycl::property::queue::in_order{}};
+    std::printf("Device: %s  (iters=%d warmup=%d)\n",
+                q.get_device().get_info<sycl::info::device::name>().c_str(), iters, warmup);
+
+    bool ok = true;
+    for (int T : {1, 2048, 8192}) {
+        ok &= run_case<false>(q, T, iters, warmup);
+        ok &= run_case<true>(q, T, iters, warmup);
+    }
+    return ok ? 0 : 1;
+}

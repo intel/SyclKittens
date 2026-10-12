@@ -1,0 +1,213 @@
+// Standalone harness for decode.dp.cpp (CONFIG=standalone, no PyTorch).
+// Included at the end of decode.dp.cpp when TORCH_COMPILE is not defined, so the
+// orchestrator core (g_queues, py_init, set_layer, set_io, run_layers) is in scope.
+//
+// Single tile (TP=1, CP=1), Llama-3-8B layer dims, NL layers of random weights.
+// For each position: one decode step checked against a CPU fp32 reference of the
+// same layer math (bf16 rounding emulated where the GPU stores bf16), then timing.
+//
+//   usage: decode [iters=50] [warmup=5]
+//   pick the GPU with ONEAPI_DEVICE_SELECTOR / ZE_AFFINITY_MASK.
+
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+
+namespace harness {
+
+constexpr int H = 4096, NQ = 32, NKV = 8, HD = 128, INTER = 14336, NL = 2;
+constexpr int MAX_CTX = 4096, QKV_OUT = (NQ + 2 * NKV) * HD;
+constexpr float EPS = 1e-5f;
+
+struct HostLayer {
+    std::vector<sbf16> norm_in, wqkv, wo, norm_post, wgate, wup, wdown, kc, vc;
+};
+
+static float lcg_uniform(uint32_t &state) {   // deterministic, in [-1, 1)
+    state = state * 1664525u + 1013904223u;
+    return static_cast<float>(state >> 8) / static_cast<float>(1u << 23) - 1.0f;
+}
+static std::vector<sbf16> rand_vec(size_t n, float scale, float offset, uint32_t &seed) {
+    std::vector<sbf16> v(n);
+    for (auto &x : v) x = sbf16(offset + scale * lcg_uniform(seed));
+    return v;
+}
+static float bf(float v) { return float(sbf16(v)); }   // round like a bf16 store
+
+static void matvec(const std::vector<sbf16> &W, const std::vector<float> &x,
+                   std::vector<float> &y, int n_out, int k) {   // W is [n_out, k]
+    y.assign(n_out, 0.f);
+    for (int n = 0; n < n_out; n++) {
+        const sbf16 *w = &W[size_t(n) * k];
+        double acc = 0.0;
+        for (int i = 0; i < k; i++) acc += double(float(w[i])) * x[i];
+        y[n] = bf(float(acc));
+    }
+}
+static std::vector<float> rmsnorm(const std::vector<float> &x, const std::vector<sbf16> &w) {
+    double ss = 0.0;
+    for (float v : x) ss += double(v) * v;
+    const float inv = 1.0f / std::sqrt(float(ss / x.size()) + EPS);
+    std::vector<float> y(x.size());
+    for (size_t i = 0; i < x.size(); i++) y[i] = bf(x[i] * inv * float(w[i]));
+    return y;
+}
+static void rope(float *row, const std::vector<sbf16> &c, const std::vector<sbf16> &s) {
+    for (int i = 0; i < HD / 2; i++) {
+        const float a = row[i], b = row[i + HD / 2], cv = float(c[i]), sv = float(s[i]);
+        row[i] = bf(a * cv - b * sv);
+        row[i + HD / 2] = bf(b * cv + a * sv);
+    }
+}
+
+// CPU reference of one decode step (all NL layers) at position `pos`.
+static std::vector<float> ref_step(const std::vector<HostLayer> &layers, std::vector<float> x,
+                                   int pos, const std::vector<sbf16> &c, const std::vector<sbf16> &s) {
+    const int group = NQ / NKV, L = pos + 1;
+    const float scale = 1.0f / std::sqrt(float(HD));
+    std::vector<float> h, qkv, o, gate, up, d;
+    for (const HostLayer &lw : layers) {
+        h = rmsnorm(x, lw.norm_in);
+        matvec(lw.wqkv, h, qkv, QKV_OUT, H);
+        for (int r = 0; r < NQ + NKV; r++) rope(&qkv[size_t(r) * HD], c, s);   // q heads, then k heads
+        const float *knew = &qkv[size_t(NQ) * HD], *vnew = &qkv[size_t(NQ + NKV) * HD];
+        std::vector<float> attn(size_t(NQ) * HD), sc(L);
+        for (int qh = 0; qh < NQ; qh++) {
+            const int kvh = qh / group;
+            const float *q = &qkv[size_t(qh) * HD];
+            auto key = [&](int t, int i) {
+                return t == pos ? knew[size_t(kvh) * HD + i]
+                                : float(lw.kc[(size_t(kvh) * MAX_CTX + t) * HD + i]); };
+            auto val = [&](int t, int i) {
+                return t == pos ? vnew[size_t(kvh) * HD + i]
+                                : float(lw.vc[(size_t(kvh) * MAX_CTX + t) * HD + i]); };
+            float m = -1e30f;
+            for (int t = 0; t < L; t++) {
+                float a = 0.f;
+                for (int i = 0; i < HD; i++) a += q[i] * key(t, i);
+                sc[t] = a * scale; m = std::max(m, sc[t]);
+            }
+            double sum = 0.0;
+            for (int t = 0; t < L; t++) { sc[t] = std::exp(sc[t] - m); sum += sc[t]; }
+            for (int i = 0; i < HD; i++) {
+                double acc = 0.0;
+                for (int t = 0; t < L; t++) acc += double(sc[t]) * val(t, i);
+                attn[size_t(qh) * HD + i] = bf(float(acc / sum));
+            }
+        }
+        matvec(lw.wo, attn, o, H, NQ * HD);
+        std::vector<float> x1(H);
+        for (int i = 0; i < H; i++) x1[i] = bf(x[i] + o[i]);
+        h = rmsnorm(x1, lw.norm_post);
+        matvec(lw.wgate, h, gate, INTER, H);
+        matvec(lw.wup, h, up, INTER, H);
+        std::vector<float> hm(INTER);
+        for (int i = 0; i < INTER; i++) hm[i] = bf(gate[i] / (1.0f + std::exp(-gate[i])) * up[i]);
+        matvec(lw.wdown, hm, d, H, INTER);
+        for (int i = 0; i < H; i++) x[i] = bf(x1[i] + d[i]);
+    }
+    return x;
+}
+
+template <typename T> static T *to_device(const std::vector<T> &h, sycl::queue &q) {
+    T *d = sycl::malloc_device<T>(h.size(), q);
+    q.memcpy(d, h.data(), h.size() * sizeof(T));
+    return d;
+}
+
+}  // namespace harness
+
+int main(int argc, char **argv) {
+    using namespace harness;
+    const int iters  = argc > 1 ? std::atoi(argv[1]) : 50;
+    const int warmup = argc > 2 ? std::atoi(argv[2]) : 5;
+
+    g_queues.emplace_back(sycl::gpu_selector_v, sycl::property::queue::in_order{});
+    sycl::queue &q = g_queues[0];
+    std::printf("Device: %s\n", q.get_device().get_info<sycl::info::device::name>().c_str());
+    py_init(1, H, INTER, QKV_OUT, NQ, HD, MAX_CTX);
+
+    // Random layers (weights scaled by 1/sqrt(in_dim)); random KV history.
+    uint32_t seed = 2024u;
+    std::vector<HostLayer> layers(NL);
+    std::vector<sbf16 *> dev_bufs;
+    for (int li = 0; li < NL; li++) {
+        HostLayer &hl = layers[li];
+        hl.norm_in   = rand_vec(H, 0.1f, 1.0f, seed);
+        hl.wqkv      = rand_vec(size_t(QKV_OUT) * H, 1.0f / std::sqrt(float(H)), 0.f, seed);
+        hl.wo        = rand_vec(size_t(H) * NQ * HD, 1.0f / std::sqrt(float(NQ * HD)), 0.f, seed);
+        hl.norm_post = rand_vec(H, 0.1f, 1.0f, seed);
+        hl.wgate     = rand_vec(size_t(INTER) * H, 1.0f / std::sqrt(float(H)), 0.f, seed);
+        hl.wup       = rand_vec(size_t(INTER) * H, 1.0f / std::sqrt(float(H)), 0.f, seed);
+        hl.wdown     = rand_vec(size_t(H) * INTER, 1.0f / std::sqrt(float(INTER)), 0.f, seed);
+        hl.kc        = rand_vec(size_t(NKV) * MAX_CTX * HD, 1.0f, 0.f, seed);
+        hl.vc        = rand_vec(size_t(NKV) * MAX_CTX * HD, 1.0f, 0.f, seed);
+        LayerW lw;
+        lw.norm_in[0] = to_device(hl.norm_in, q);   lw.Wqkv[0]  = to_device(hl.wqkv, q);
+        lw.Wo[0]      = to_device(hl.wo, q);        lw.norm_post[0] = to_device(hl.norm_post, q);
+        lw.Wgate[0]   = to_device(hl.wgate, q);     lw.Wup[0]   = to_device(hl.wup, q);
+        lw.Wdown[0]   = to_device(hl.wdown, q);
+        lw.kc[0]      = to_device(hl.kc, q);        lw.vc[0]    = to_device(hl.vc, q);
+        lw.inter = INTER;
+        set_layer(li, NL, lw);
+        for (sbf16 *p : {lw.norm_in[0], lw.Wqkv[0], lw.Wo[0], lw.norm_post[0], lw.Wgate[0],
+                         lw.Wup[0], lw.Wdown[0], lw.kc[0], lw.vc[0]}) dev_bufs.push_back(p);
+    }
+    const std::vector<sbf16> x0 = rand_vec(H, 1.0f, 0.f, seed);
+    sbf16 *d_x = sycl::malloc_device<sbf16>(H, q);
+    sbf16 *d_cos = sycl::malloc_device<sbf16>(HD / 2, q);
+    sbf16 *d_sin = sycl::malloc_device<sbf16>(HD / 2, q);
+    set_io(&d_x, &d_cos, &d_sin);
+    q.wait();
+
+    bool all_pass = true;
+    for (int pos : {127, 4095}) {
+        std::vector<sbf16> c(HD / 2), s(HD / 2);
+        for (int i = 0; i < HD / 2; i++) {   // Llama-3 rope theta
+            const double ang = pos * std::pow(500000.0, -2.0 * i / HD);
+            c[i] = sbf16(float(std::cos(ang))); s[i] = sbf16(float(std::sin(ang)));
+        }
+        q.memcpy(d_cos, c.data(), c.size() * sizeof(sbf16));
+        q.memcpy(d_sin, s.data(), s.size() * sizeof(sbf16));
+        for (int li = 0; li < NL; li++) {   // pristine KV history for the check
+            q.memcpy(g_layers[li].kc[0], layers[li].kc.data(), layers[li].kc.size() * sizeof(sbf16));
+            q.memcpy(g_layers[li].vc[0], layers[li].vc.data(), layers[li].vc.size() * sizeof(sbf16));
+        }
+        q.memcpy(d_x, x0.data(), H * sizeof(sbf16));
+        run_layers(pos, NQ, NKV, EPS);
+        std::vector<sbf16> x_gpu(H);
+        q.memcpy(x_gpu.data(), d_x, H * sizeof(sbf16)).wait();
+
+        std::vector<float> xin(H);
+        for (int i = 0; i < H; i++) xin[i] = float(x0[i]);
+        const std::vector<float> x_ref = ref_step(layers, xin, pos, c, s);
+        double e2 = 0.0, r2 = 0.0;
+        for (int i = 0; i < H; i++) {
+            const double dlt = double(float(x_gpu[i])) - x_ref[i];
+            e2 += dlt * dlt; r2 += double(x_ref[i]) * x_ref[i];
+        }
+        const double rel = std::sqrt(e2 / (r2 + 1e-30));
+        const bool pass = rel < 3e-2;
+        all_pass = all_pass && pass;
+
+        for (int i = 0; i < warmup; i++) run_layers(pos, NQ, NKV, EPS);
+        q.wait();
+        const auto t0 = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < iters; i++) run_layers(pos, NQ, NKV, EPS);
+        q.wait();
+        const auto t1 = std::chrono::high_resolution_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / iters;
+
+        std::printf("decode TP=1 layers=%d H=%d nq=%d nkv=%d hd=%d inter=%d pos=%d: "
+                    "%.3f ms/token (%.3f ms/layer, iters=%d warmup=%d)  rel_l2=%.2e  %s\n",
+                    NL, H, NQ, NKV, HD, INTER, pos, ms, ms / NL, iters, warmup, rel,
+                    pass ? "PASS" : "FAIL");
+    }
+
+    for (sbf16 *p : dev_bufs) sycl::free(p, q);
+    sycl::free(d_x, q); sycl::free(d_cos, q); sycl::free(d_sin, q);
+    py_cleanup();
+    return all_pass ? 0 : 1;
+}

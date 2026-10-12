@@ -1,0 +1,96 @@
+// Standalone harness for rotary.dp.cpp (CONFIG=standalone, no PyTorch).
+// Included at the end of rotary.dp.cpp when TORCH_COMPILE is not defined, so
+// ROTARY_D and launch_rotary() are already in scope.
+//
+//   usage: rotary [iters=100] [warmup=10]
+//   pick the GPU with ONEAPI_DEVICE_SELECTOR / ZE_AFFINITY_MASK.
+
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
+
+// Deterministic values in [-1, 1) so the run is reproducible.
+static float lcg_uniform(uint32_t &state) {
+    state = state * 1664525u + 1013904223u;
+    return static_cast<float>(state >> 8) / static_cast<float>(1u << 23) - 1.0f;
+}
+
+// One forward (negate_sin=false) or backward (negate_sin=true) case; returns pass.
+static bool run_case(sycl::queue &queue, int B, int N, int H, bool negate_sin,
+                     int iters, int warmup) {
+    constexpr int D = ROTARY_D, HALF = D / 2;
+    const size_t nx = size_t(B) * N * H * D, ncs = size_t(N) * HALF;
+
+    uint32_t seed = 12345u + uint32_t(N) * 7u + (negate_sin ? 1u : 0u);
+    std::vector<bf16> h_x(nx), h_cos(ncs), h_sin(ncs), h_out(nx);
+    for (auto &v : h_x) v = bf16(lcg_uniform(seed));
+    for (size_t i = 0; i < ncs; i++) {
+        const float ang = 3.14159265f * lcg_uniform(seed);
+        h_cos[i] = bf16(std::cos(ang));
+        h_sin[i] = bf16(std::sin(ang));
+    }
+
+    bf16 *d_x   = sycl::malloc_device<bf16>(nx, queue);
+    bf16 *d_out = sycl::malloc_device<bf16>(nx, queue);
+    bf16 *d_cos = sycl::malloc_device<bf16>(ncs, queue);
+    bf16 *d_sin = sycl::malloc_device<bf16>(ncs, queue);
+    queue.memcpy(d_x, h_x.data(), nx * sizeof(bf16));
+    queue.memcpy(d_cos, h_cos.data(), ncs * sizeof(bf16));
+    queue.memcpy(d_sin, h_sin.data(), ncs * sizeof(bf16));
+    queue.wait();
+
+    auto launch = [&] {
+        if (negate_sin) launch_rotary<D, true >(queue, d_x, d_out, d_cos, d_sin, B, N, H);
+        else            launch_rotary<D, false>(queue, d_x, d_out, d_cos, d_sin, B, N, H);
+    };
+    for (int i = 0; i < warmup; i++) launch();
+    queue.wait();
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < iters; i++) launch();
+    queue.wait();
+    const auto t1 = std::chrono::high_resolution_clock::now();
+    const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / iters;
+    const double bytes = 2.0 * nx * sizeof(bf16) + 2.0 * ncs * sizeof(bf16);
+
+    // Full fp32 reference: neox half-split rotation with shared (N, D/2) cos/sin.
+    queue.memcpy(h_out.data(), d_out, nx * sizeof(bf16)).wait();
+    double max_err = 0.0;
+    for (size_t row = 0; row < size_t(B) * N * H; row++) {
+        const int n = int((row / H) % N);
+        for (int d = 0; d < HALF; d++) {
+            const float a = float(h_x[row * D + d]), b = float(h_x[row * D + HALF + d]);
+            const float c = float(h_cos[size_t(n) * HALF + d]);
+            const float s = negate_sin ? -float(h_sin[size_t(n) * HALF + d])
+                                       :  float(h_sin[size_t(n) * HALF + d]);
+            const double r1 = a * c - b * s, r2 = b * c + a * s;
+            max_err = std::fmax(max_err, std::fabs(double(float(h_out[row * D + d])) - r1));
+            max_err = std::fmax(max_err, std::fabs(double(float(h_out[row * D + HALF + d])) - r2));
+        }
+    }
+    const bool pass = max_err <= 1e-2;
+    std::printf("rotary %s B=%d T=%d H=%d D=%d: %.4f ms  %.1f GB/s  max_err=%.2e  %s\n",
+                negate_sin ? "bwd" : "fwd", B, N, H, D, ms, bytes / (ms * 1e-3) / 1e9,
+                max_err, pass ? "PASS" : "FAIL");
+
+    sycl::free(d_x, queue); sycl::free(d_out, queue);
+    sycl::free(d_cos, queue); sycl::free(d_sin, queue);
+    return pass;
+}
+
+int main(int argc, char **argv) {
+    const int iters  = argc > 1 ? std::atoi(argv[1]) : 100;
+    const int warmup = argc > 2 ? std::atoi(argv[2]) : 10;
+
+    sycl::queue queue{sycl::gpu_selector_v, sycl::property::queue::in_order{}};
+    std::printf("Device: %s  (iters=%d warmup=%d)\n",
+                queue.get_device().get_info<sycl::info::device::name>().c_str(), iters, warmup);
+
+    bool ok = true;
+    for (int T : {1, 2048})
+        for (bool bwd : {false, true})
+            ok &= run_case(queue, /*B=*/1, T, /*H=*/32, bwd, iters, warmup);
+    return ok ? 0 : 1;
+}

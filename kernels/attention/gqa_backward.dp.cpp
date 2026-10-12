@@ -11,10 +11,6 @@
 
 #include "kittens.dp.hpp"
 #include "ops/warp/register/tile/conversions.dp.hpp"
-#include "pyutils/torch_helpers.dp.hpp"
-
-#include <torch/extension.h>
-#include <c10/xpu/XPUStream.h>
 using namespace kittens;
 
 // ============================================================
@@ -370,21 +366,13 @@ SYCL_EXTERNAL void attend_bwd_fused_ker(
 }
 
 // ============================================================
-// Dispatch
+// Shared raw-pointer entries (both builds). All tensors BNHD except
+// L/delta [B,H,N] f32. Q/K/V/O/dO bf16; dQ/dK/dV f32.
 // ============================================================
 
-void dispatch_prep(torch::Tensor O, torch::Tensor dO, torch::Tensor delta) {
-    CHECK_INPUT(O); CHECK_INPUT(dO); CHECK_INPUT(delta);
-    const int B = O.size(0), N = O.size(1), H = O.size(2);
-
-    auto stream = c10::xpu::getCurrentXPUStream(O.device().index());
-    auto &queue = stream.queue();
-    queue.wait();
-
-    bf16  *d_O_bf  = reinterpret_cast<bf16*>(O.data_ptr<c10::BFloat16>());
-    bf16  *d_dO_bf = reinterpret_cast<bf16*>(dO.data_ptr<c10::BFloat16>());
-    float *d_delta = delta.data_ptr<float>();
-
+// delta[b,h,q] = rowsum(dO * O). Blocks until done.
+static void run_prep(sycl::queue &queue, bf16 *d_O_bf, bf16 *d_dO_bf,
+                     float *d_delta, int B, int N, int H) {
     bwd_gl<ATTN_D> Og(d_O_bf,  B, N, H, nullptr);
     bwd_gl<ATTN_D> dOg(d_dO_bf, B, N, H, nullptr);
 
@@ -407,43 +395,13 @@ void dispatch_prep(torch::Tensor O, torch::Tensor dO, torch::Tensor delta) {
     queue.wait();
 }
 
-// Allocate the P^T / dS^T reorder scratch: [B, kv_blocks*128, H_KV, 128] bf16.
-static torch::Tensor make_reorder_scratch(int B, int N, int H_KV, torch::Tensor like) {
-    auto opts = torch::TensorOptions().dtype(torch::kBFloat16).device(like.device());
-    return torch::empty({(long)B, (long)N, (long)H_KV, (long)ATTN_D}, opts);
-}
-
-void dispatch_bwd(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
-                  torch::Tensor dO, torch::Tensor L, torch::Tensor delta,
-                  torch::Tensor dQ, torch::Tensor dK, torch::Tensor dV) {
-    CHECK_INPUT(Q); CHECK_INPUT(K); CHECK_INPUT(V); CHECK_INPUT(dO);
-    CHECK_INPUT(L); CHECK_INPUT(delta);
-    CHECK_INPUT(dQ); CHECK_INPUT(dK); CHECK_INPUT(dV);
-
-    const int B = Q.size(0), N = Q.size(1), H = Q.size(2), H_KV = K.size(2);
-
-    auto stream = c10::xpu::getCurrentXPUStream(Q.device().index());
-    auto &queue = stream.queue();
-    queue.wait();
-
-    bf16  *d_Q  = reinterpret_cast<bf16*>(Q.data_ptr<c10::BFloat16>());
-    bf16  *d_K  = reinterpret_cast<bf16*>(K.data_ptr<c10::BFloat16>());
-    bf16  *d_V  = reinterpret_cast<bf16*>(V.data_ptr<c10::BFloat16>());
-    bf16  *d_dO = reinterpret_cast<bf16*>(dO.data_ptr<c10::BFloat16>());
-    float *d_L     = L.data_ptr<float>();
-    float *d_delta = delta.data_ptr<float>();
-    float *d_dQ    = dQ.data_ptr<float>();
-    float *d_dK    = dK.data_ptr<float>();
-    float *d_dV    = dV.data_ptr<float>();
-
-    // Reorder scratch (bf16 P^T and dS^T), shaped [B, N(kv), H_KV, D(q=128)].
-    torch::Tensor Pt  = make_reorder_scratch(B, N, H_KV, Q);
-    torch::Tensor dSt = make_reorder_scratch(B, N, H_KV, Q);
-    torch::Tensor dSq = make_reorder_scratch(B, N, H_KV, Q);  // dQ q-major scratch
-    bf16 *d_Pt  = reinterpret_cast<bf16*>(Pt.data_ptr<c10::BFloat16>());
-    bf16 *d_dSt = reinterpret_cast<bf16*>(dSt.data_ptr<c10::BFloat16>());
-    bf16 *d_dSq = reinterpret_cast<bf16*>(dSq.data_ptr<c10::BFloat16>());
-
+// Fused causal dV/dK/dQ. d_Pt/d_dSt/d_dSq are caller-owned bf16 reorder scratch
+// buffers of B*N*H_KV*ATTN_D elements each. Blocks until done.
+static void run_bwd(sycl::queue &queue, bf16 *d_Q, bf16 *d_K, bf16 *d_V,
+                    bf16 *d_dO, float *d_L, float *d_delta,
+                    float *d_dQ, float *d_dK, float *d_dV,
+                    bf16 *d_Pt, bf16 *d_dSt, bf16 *d_dSq,
+                    int B, int N, int H, int H_KV) {
     bwd_gl<ATTN_D> Qg(d_Q, B, N, H, nullptr);
     bwd_gl<ATTN_D> Kg(d_K, B, N, H_KV, nullptr);
     bwd_gl<ATTN_D> Vg(d_V, B, N, H_KV, nullptr);
@@ -476,7 +434,70 @@ void dispatch_bwd(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
     }
 }
 
+#ifdef TORCH_COMPILE
+// ============================================================
+// PyTorch dispatch
+// ============================================================
+#include "pyutils/torch_helpers.dp.hpp"
+#include <torch/extension.h>
+#include <c10/xpu/XPUStream.h>
+
+void dispatch_prep(torch::Tensor O, torch::Tensor dO, torch::Tensor delta) {
+    CHECK_INPUT(O); CHECK_INPUT(dO); CHECK_INPUT(delta);
+    const int B = O.size(0), N = O.size(1), H = O.size(2);
+
+    auto stream = c10::xpu::getCurrentXPUStream(O.device().index());
+    auto &queue = stream.queue();
+    queue.wait();
+
+    run_prep(queue, reinterpret_cast<bf16*>(O.data_ptr<c10::BFloat16>()),
+             reinterpret_cast<bf16*>(dO.data_ptr<c10::BFloat16>()),
+             delta.data_ptr<float>(), B, N, H);
+}
+
+// Allocate the P^T / dS^T reorder scratch: [B, kv_blocks*128, H_KV, 128] bf16.
+static torch::Tensor make_reorder_scratch(int B, int N, int H_KV, torch::Tensor like) {
+    auto opts = torch::TensorOptions().dtype(torch::kBFloat16).device(like.device());
+    return torch::empty({(long)B, (long)N, (long)H_KV, (long)ATTN_D}, opts);
+}
+
+void dispatch_bwd(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
+                  torch::Tensor dO, torch::Tensor L, torch::Tensor delta,
+                  torch::Tensor dQ, torch::Tensor dK, torch::Tensor dV) {
+    CHECK_INPUT(Q); CHECK_INPUT(K); CHECK_INPUT(V); CHECK_INPUT(dO);
+    CHECK_INPUT(L); CHECK_INPUT(delta);
+    CHECK_INPUT(dQ); CHECK_INPUT(dK); CHECK_INPUT(dV);
+
+    const int B = Q.size(0), N = Q.size(1), H = Q.size(2), H_KV = K.size(2);
+
+    auto stream = c10::xpu::getCurrentXPUStream(Q.device().index());
+    auto &queue = stream.queue();
+    queue.wait();
+
+    // Reorder scratch (bf16 P^T and dS^T), shaped [B, N(kv), H_KV, D(q=128)].
+    torch::Tensor Pt  = make_reorder_scratch(B, N, H_KV, Q);
+    torch::Tensor dSt = make_reorder_scratch(B, N, H_KV, Q);
+    torch::Tensor dSq = make_reorder_scratch(B, N, H_KV, Q);  // dQ q-major scratch
+
+    run_bwd(queue,
+            reinterpret_cast<bf16*>(Q.data_ptr<c10::BFloat16>()),
+            reinterpret_cast<bf16*>(K.data_ptr<c10::BFloat16>()),
+            reinterpret_cast<bf16*>(V.data_ptr<c10::BFloat16>()),
+            reinterpret_cast<bf16*>(dO.data_ptr<c10::BFloat16>()),
+            L.data_ptr<float>(), delta.data_ptr<float>(),
+            dQ.data_ptr<float>(), dK.data_ptr<float>(), dV.data_ptr<float>(),
+            reinterpret_cast<bf16*>(Pt.data_ptr<c10::BFloat16>()),
+            reinterpret_cast<bf16*>(dSt.data_ptr<c10::BFloat16>()),
+            reinterpret_cast<bf16*>(dSq.data_ptr<c10::BFloat16>()),
+            B, N, H, H_KV);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("dispatch_prep", &dispatch_prep);
     m.def("dispatch_bwd", &dispatch_bwd);
 }
+
+#else
+// Standalone executable (CONFIG=standalone): main() lives in the harness.
+#include "gqa_backward_harness.impl"
+#endif  // TORCH_COMPILE
