@@ -477,7 +477,10 @@ template <> struct convertor<sycl::float2, bf16_2> {
 };
 template <> struct convertor<bf16_2, sycl::float2> {
     static inline bf16_2 convert(const sycl::float2 &u) {
-        return sycl::vec<sycl::ext::oneapi::bfloat16, 2>(u.x(), u.y());
+        // Reuse the scalar converter: the bf16_2 vec constructor lowers to a
+        // software RNE sequence (shr/and/add3 + NaN branch) on Xe2.
+        return bf16_2(convertor<bf16, float>::convert(u.x()),
+                      convertor<bf16, float>::convert(u.y()));
     }
 };
 template <> struct convertor<float, sycl::half> {
