@@ -355,6 +355,12 @@ static inline fwd_choice choose_fwd(int N, int B, bool causal, bool bf16_out) {
     // default. bf16 and f32 winners diverge on 22 shapes (the bf16 store
     // epilogue shifts the register-pressure balance), so we keep two tables.
     // N>2048 is uniformly wg256/sq16 (both dtypes, both causal, all B).
+#ifdef KITTENS_BMG
+    // B70 (Xe2) sweep, bf16 out, B in {1,4}, N 512..8192: with the register-
+    // region row reductions wg256/sq8 is fastest (or within noise) for every
+    // causal and non-causal shape (non-causal N4096: 77 vs 50 TF for wg256/sq16).
+    if (bf16_out && N >= 512) return fwd_choice{256, 8};
+#endif
     if (N > 2048) return fwd_choice{256, 16};
     if (bf16_out) {
       if (causal) {
