@@ -37,6 +37,33 @@ inline float reduce_16x16(const sycl::float2 *first_half,
  * @param[in] src The source matrix on which to perform the reduction.
  * @param[in] src_accum The initial value of the accumulator, used when reset is false.
  */
+/**
+ * @brief Transposing butterfly: reduce ROWS per-lane row partials across the 16
+ * SIMD lanes so that lane L ends with the reduction of row L (L % ROWS).
+ *
+ * Each stage swaps half of the remaining rows with the partner lane, so all rows
+ * are reduced together: ROWS-1 shuffles (plus one fold for ROWS=8) instead of
+ * 4 per row. Shuffles lower to serialized a0-indirect moves on Xe, so this
+ * removes ~3/4 of them from softmax row reductions.
+ */
+template <typename op, typename type, int ROWS>
+static inline type transpose_reduce_rows(type (&a)[ROWS], int lane) {
+  static_assert(ROWS == 16 || ROWS == 8, "16 or 8 rows per SIMD16 tile");
+#pragma unroll
+  for (int s = ROWS / 2; s >= 1; s >>= 1) {
+    const bool hi = (lane & s) != 0;
+#pragma unroll
+    for (int r = 0; r < s; r++) {
+      const type keep = hi ? a[r + s] : a[r];
+      const type send = hi ? a[r] : a[r + s];
+      a[r] = op::template op<type>(keep, packed_shfl_sync(MASK_ALL, send, lane ^ s));
+    }
+  }
+  if constexpr (ROWS == 8)   // rows 0-7 are spread over both lane halves: fold them
+    a[0] = op::template op<type>(a[0], packed_shfl_sync(MASK_ALL, a[0], lane ^ 8));
+  return a[0];
+}
+
 template <typename op, ducks::rv::all V, ducks::rt::row_layout T, bool reset>
 static inline void row_reduce(V &row_accum, const T &src, const V &src_accum) {
   // I actually like these static asserts because they give more verbose errors
@@ -66,56 +93,38 @@ static inline void row_reduce(V &row_accum, const T &src, const V &src_accum) {
   for (int i = 0; i < src.height; i++) {
 #pragma unroll
     for (int j = 0; j < src.width; j++) {
-        type tile_result{};
+      // Per-lane row partials: rows[2k] = data[k].x, rows[2k+1] = data[k].y
+      // (the 32-column shapes first combine their two 16-column halves in-lane),
+      // then one transposing butterfly leaves row L's reduction in lane L.
+      type tile_result;
       if constexpr (std::is_same_v<typename T::shape,
                                    ducks::rt_shape::rt_8x32>) {
-        // 8x32: 8 rows, data[0-3]=cols0-15, data[4-7]=cols16-31 (offset +4,
-        // not +8). Only 4 packed pairs -> fills lanes 0-7 (rows 0-7).
+        // 8x32: 8 rows, data[0-3]=cols0-15, data[4-7]=cols16-31 (offset +4).
+        type rows[8];
 #pragma unroll
         for (int k = 0; k < 4; k++) {
-          type val_x = op::template op<type>(src.tiles[i][j].data[k].x(),
-                                             src.tiles[i][j].data[k + 4].x());
-          type val_y = op::template op<type>(src.tiles[i][j].data[k].y(),
-                                             src.tiles[i][j].data[k + 4].y());
-          // XOR butterfly reduction across 16 SIMD lanes (32 cols -> scalar)
-#pragma unroll
-          for (int stride = 8; stride >= 1; stride >>= 1) {
-            val_x = op::template op<type>(
-                val_x, packed_shfl_sync(MASK_ALL, val_x, lane ^ stride));
-            val_y = op::template op<type>(
-                val_y, packed_shfl_sync(MASK_ALL, val_y, lane ^ stride));
-          }
-          if (lane == 2 * k)     tile_result = val_x;
-          if (lane == 2 * k + 1) tile_result = val_y;
+          rows[2 * k]     = op::template op<type>(src.tiles[i][j].data[k].x(),
+                                                  src.tiles[i][j].data[k + 4].x());
+          rows[2 * k + 1] = op::template op<type>(src.tiles[i][j].data[k].y(),
+                                                  src.tiles[i][j].data[k + 4].y());
         }
+        tile_result = transpose_reduce_rows<op>(rows, lane);
       } else {
+        type rows[16];
 #pragma unroll
-      for (int k = 0; k < 8; k++) {
-        type val_x, val_y;
-        if constexpr (std::is_same_v<typename T::shape,
-                                     ducks::rt_shape::rt_16x32>) {
-          // 16x32: combine two 16-column halves within-lane first
-          val_x = op::template op<type>(src.tiles[i][j].data[k].x(),
-                                        src.tiles[i][j].data[k + 8].x());
-          val_y = op::template op<type>(src.tiles[i][j].data[k].y(),
-                                        src.tiles[i][j].data[k + 8].y());
-        } else {
-          val_x = src.tiles[i][j].data[k].x();
-          val_y = src.tiles[i][j].data[k].y();
+        for (int k = 0; k < 8; k++) {
+          if constexpr (std::is_same_v<typename T::shape,
+                                       ducks::rt_shape::rt_16x32>) {
+            rows[2 * k]     = op::template op<type>(src.tiles[i][j].data[k].x(),
+                                                    src.tiles[i][j].data[k + 8].x());
+            rows[2 * k + 1] = op::template op<type>(src.tiles[i][j].data[k].y(),
+                                                    src.tiles[i][j].data[k + 8].y());
+          } else {
+            rows[2 * k]     = src.tiles[i][j].data[k].x();
+            rows[2 * k + 1] = src.tiles[i][j].data[k].y();
+          }
         }
-        // XOR butterfly reduction across 16 SIMD lanes
-#pragma unroll
-        for (int stride = 8; stride >= 1; stride >>= 1) {
-          val_x = op::template op<type>(
-              val_x, packed_shfl_sync(MASK_ALL, val_x, lane ^ stride));
-          val_y = op::template op<type>(
-              val_y, packed_shfl_sync(MASK_ALL, val_y, lane ^ stride));
-        }
-        // All lanes now have reduce(row 2k) in val_x, reduce(row 2k+1) in val_y.
-        // Scatter: lane 2k stores reduce(row 2k), lane 2k+1 stores reduce(row 2k+1).
-        if (lane == 2 * k)     tile_result = val_x;
-        if (lane == 2 * k + 1) tile_result = val_y;
-      }
+        tile_result = transpose_reduce_rows<op>(rows, lane);
       }
       if (j == 0) {
         if constexpr (reset) {
