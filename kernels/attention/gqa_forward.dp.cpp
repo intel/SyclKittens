@@ -205,11 +205,24 @@ SYCL_EXTERNAL void attend_ker_gqa_fwd(
   v_desc.init(Vg.raw_ptr + kv_off, D * (int)sizeof(bf16), kv_rows, kv_pitch);
   v_pf.init  (Vg.raw_ptr + kv_off, D * (int)sizeof(bf16), kv_rows, kv_pitch);
 
-  // ── Prefetch first K tile ──────────────────────────────────
-  if (PF > 0 && loop_kv_tiles > 0)
-    static_for<inner_loop>([&](auto c) {
-      k_pf.template prefetch<decltype(c)::value * kv_stride, 0>();
-    });
+  // Cooperative prefetch: every subgroup of the WG reads the same K/V tile,
+  // so the next tile's pf_blocks 32x32 blocks (K then V columns) are split
+  // across the subgroups instead of each subgroup prefetching all of them.
+  constexpr int pf_blocks = 2 * (D / kv_stride);
+  auto prefetch_tile = [&](int tile) {
+    for (int b = sg_id % pf_blocks; b < pf_blocks; b += num_sg) {
+      if (b < pf_blocks / 2) {
+        k_pf.set_block(b * kv_stride, tile * kv_stride);
+        k_pf.prefetch();
+      } else {
+        v_pf.set_block((b - pf_blocks / 2) * kv_stride, tile * kv_stride);
+        v_pf.prefetch();
+      }
+    }
+  };
+
+  // ── Prefetch first K/V tile ────────────────────────────────
+  if (PF > 0 && loop_kv_tiles > 0) prefetch_tile(0);
 
   int prefetch = PF;
 
@@ -223,13 +236,9 @@ SYCL_EXTERNAL void attend_ker_gqa_fwd(
     zero(att_block);
     max_vec_last = max_vec;
 
-    const bool do_pf = prefetch < loop_kv_tiles;
     k_desc.set_y(i * kv_stride);
     v_desc.set_y(i * kv_stride);
-    if (do_pf) {
-      k_pf.set_y(prefetch * kv_stride);
-      v_pf.set_y(prefetch * kv_stride);
-    }
+    if (prefetch < loop_kv_tiles) prefetch_tile(prefetch);
 
     // ── Step 1: S[seq_q×32] = Q[seq_q×D] × K^T[D×32] ──────
     k_chunk_t k_reg;
@@ -240,7 +249,6 @@ SYCL_EXTERNAL void attend_ker_gqa_fwd(
       k_desc.template load<x + 8, 0 >(kd + 8);
       k_desc.template load<x,     16>(kd + 16);
       k_desc.template load<x + 8, 16>(kd + 24);
-      if (do_pf) k_pf.template prefetch<decltype(c)::value * kv_stride, 0>();
       mma<transpose::N, transpose::T>(att_block, q_preloaded[c], k_reg, att_block);
     });
 
@@ -275,8 +283,7 @@ SYCL_EXTERNAL void attend_ker_gqa_fwd(
     p_mma_t p_mma;
     p_mma = att_block;  // float→bf16 conversion
 
-    // V columns [h*v_cols, (h+1)*v_cols) into v_reg, then prefetch the same
-    // columns of the next tile.
+    // V columns [h*v_cols, (h+1)*v_cols) into v_reg.
     v_half_t v_reg;
     auto load_v = [&](auto h) {
       static_for<v_half_t::width>([&](auto j) {
@@ -284,19 +291,11 @@ SYCL_EXTERNAL void attend_ker_gqa_fwd(
             &v_reg.tiles[0][decltype(j)::value].data[0]);
       });
     };
-    auto prefetch_v = [&](auto h) {
-      if (do_pf)
-        static_for<v_half_t::width>([&](auto j) {
-          v_pf.template prefetch<decltype(h)::value * v_cols + decltype(j)::value * kv_stride, 0>();
-        });
-    };
     load_v(std::integral_constant<int, 0>{});
     mma<transpose::N, transpose::N>(o_reg_1, p_mma, v_reg, o_reg_1);
-    prefetch_v(std::integral_constant<int, 0>{});
     if constexpr (SPLIT_D) {
       load_v(std::integral_constant<int, 1>{});
       mma<transpose::N, transpose::N>(o_reg_2, p_mma, v_reg, o_reg_2);
-      prefetch_v(std::integral_constant<int, 1>{});
     }
   }
 
