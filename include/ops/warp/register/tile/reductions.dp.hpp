@@ -37,6 +37,110 @@ inline float reduce_16x16(const sycl::float2 *first_half,
  * @param[in] src The source matrix on which to perform the reduction.
  * @param[in] src_accum The initial value of the accumulator, used when reset is false.
  */
+#ifdef __SYCL_DEVICE_ONLY__
+// Register-region transpose-reduce of 16 (or 8) per-lane row partials across the
+// 16 SIMD lanes: lane L gets the reduction of row L. Every stage is a plain SIMD16
+// mov/op on GRF regions, so there are no a0-indirect shuffles (which serialize on
+// Xe). Same data movement as sycl-tla's hreduce16/8_float_* (BSD-3-Clause,
+// Copyright 2025 Intel Corporation). For 8 rows, lanes 8-15 are left undefined.
+typedef float sk_float16v __attribute__((ext_vector_type(16)));
+typedef float sk_float8v __attribute__((ext_vector_type(8)));
+#define SK_DEFINE_HREDUCE16(op) \
+  static inline float sk_hreduce16_##op(sk_float16v x) { \
+    float y; \
+    asm("{\n" \
+        ".decl SKR_S v_type=G type=F num_elts=512 align=wordx32\n" \
+        ".decl SKR_T v_type=G type=F num_elts=256 align=wordx32\n" \
+        "mov (M1_NM,16) SKR_S(0,0)<1> %1(0,0)<16;8,1>\n" \
+        "mov (M1_NM,16) SKR_S(1,0)<1> %1(0,8)<16;8,1>\n" \
+        "mov (M1_NM,16) SKR_S(2,0)<1> %1(2,0)<16;8,1>\n" \
+        "mov (M1_NM,16) SKR_S(3,0)<1> %1(2,8)<16;8,1>\n" \
+        "mov (M1_NM,16) SKR_S(4,0)<1> %1(4,0)<16;8,1>\n" \
+        "mov (M1_NM,16) SKR_S(5,0)<1> %1(4,8)<16;8,1>\n" \
+        "mov (M1_NM,16) SKR_S(6,0)<1> %1(6,0)<16;8,1>\n" \
+        "mov (M1_NM,16) SKR_S(7,0)<1> %1(6,8)<16;8,1>\n" \
+        "mov (M1_NM,16) SKR_S(8,0)<1> %1(8,0)<16;8,1>\n" \
+        "mov (M1_NM,16) SKR_S(9,0)<1> %1(8,8)<16;8,1>\n" \
+        "mov (M1_NM,16) SKR_S(10,0)<1> %1(10,0)<16;8,1>\n" \
+        "mov (M1_NM,16) SKR_S(11,0)<1> %1(10,8)<16;8,1>\n" \
+        "mov (M1_NM,16) SKR_S(12,0)<1> %1(12,0)<16;8,1>\n" \
+        "mov (M1_NM,16) SKR_S(13,0)<1> %1(12,8)<16;8,1>\n" \
+        "mov (M1_NM,16) SKR_S(14,0)<1> %1(14,0)<16;8,1>\n" \
+        "mov (M1_NM,16) SKR_S(15,0)<1> %1(14,8)<16;8,1>\n" \
+        #op " (M1_NM,16) SKR_T(0,0)<1> SKR_S(0,0)<1;1,0> SKR_S(1,0)<1;1,0>\n" \
+        #op " (M1_NM,16) SKR_T(1,0)<1> SKR_S(2,0)<1;1,0> SKR_S(3,0)<1;1,0>\n" \
+        #op " (M1_NM,16) SKR_T(2,0)<1> SKR_S(4,0)<1;1,0> SKR_S(5,0)<1;1,0>\n" \
+        #op " (M1_NM,16) SKR_T(3,0)<1> SKR_S(6,0)<1;1,0> SKR_S(7,0)<1;1,0>\n" \
+        #op " (M1_NM,16) SKR_T(4,0)<1> SKR_S(8,0)<1;1,0> SKR_S(9,0)<1;1,0>\n" \
+        #op " (M1_NM,16) SKR_T(5,0)<1> SKR_S(10,0)<1;1,0> SKR_S(11,0)<1;1,0>\n" \
+        #op " (M1_NM,16) SKR_T(6,0)<1> SKR_S(12,0)<1;1,0> SKR_S(13,0)<1;1,0>\n" \
+        #op " (M1_NM,16) SKR_T(7,0)<1> SKR_S(14,0)<1;1,0> SKR_S(15,0)<1;1,0>\n" \
+        "mov (M1_NM,16) SKR_S(16,0)<1> SKR_T(0,0)<8;4,1>\n" \
+        "mov (M1_NM,16) SKR_S(17,0)<1> SKR_T(0,4)<8;4,1>\n" \
+        "mov (M1_NM,16) SKR_S(18,0)<1> SKR_T(2,0)<8;4,1>\n" \
+        "mov (M1_NM,16) SKR_S(19,0)<1> SKR_T(2,4)<8;4,1>\n" \
+        "mov (M1_NM,16) SKR_S(20,0)<1> SKR_T(4,0)<8;4,1>\n" \
+        "mov (M1_NM,16) SKR_S(21,0)<1> SKR_T(4,4)<8;4,1>\n" \
+        "mov (M1_NM,16) SKR_S(22,0)<1> SKR_T(6,0)<8;4,1>\n" \
+        "mov (M1_NM,16) SKR_S(23,0)<1> SKR_T(6,4)<8;4,1>\n" \
+        #op " (M1_NM,16) SKR_T(8,0)<1> SKR_S(16,0)<1;1,0> SKR_S(17,0)<1;1,0>\n" \
+        #op " (M1_NM,16) SKR_T(9,0)<1> SKR_S(18,0)<1;1,0> SKR_S(19,0)<1;1,0>\n" \
+        #op " (M1_NM,16) SKR_T(10,0)<1> SKR_S(20,0)<1;1,0> SKR_S(21,0)<1;1,0>\n" \
+        #op " (M1_NM,16) SKR_T(11,0)<1> SKR_S(22,0)<1;1,0> SKR_S(23,0)<1;1,0>\n" \
+        "mov (M1_NM,16) SKR_S(24,0)<1> SKR_T(8,0)<4;2,1>\n" \
+        "mov (M1_NM,16) SKR_S(25,0)<1> SKR_T(8,2)<4;2,1>\n" \
+        "mov (M1_NM,16) SKR_S(26,0)<1> SKR_T(10,0)<4;2,1>\n" \
+        "mov (M1_NM,16) SKR_S(27,0)<1> SKR_T(10,2)<4;2,1>\n" \
+        #op " (M1_NM,16) SKR_T(12,0)<1> SKR_S(24,0)<1;1,0> SKR_S(25,0)<1;1,0>\n" \
+        #op " (M1_NM,16) SKR_T(13,0)<1> SKR_S(26,0)<1;1,0> SKR_S(27,0)<1;1,0>\n" \
+        "mov (M1_NM,16) SKR_S(28,0)<1> SKR_T(12,0)<2;1,0>\n" \
+        "mov (M1_NM,16) SKR_S(29,0)<1> SKR_T(12,1)<2;1,0>\n" \
+        #op " (M1_NM,16) %0(0,0)<1> SKR_S(28,0)<1;1,0> SKR_S(29,0)<1;1,0>\n" \
+        "}\n" : "=rw"(y) : "rw"(x)); \
+    return y; \
+  }
+
+#define SK_DEFINE_HREDUCE8(op) \
+  static inline float sk_hreduce8_##op(sk_float8v x) { \
+    float y; \
+    asm("{\n" \
+        ".decl SKR_S v_type=G type=F num_elts=256 align=wordx32\n" \
+        ".decl SKR_T v_type=G type=F num_elts=128 align=wordx32\n" \
+        "mov (M1_NM,16) SKR_S(0,0)<1> %1(0,0)<16;8,1>\n" \
+        "mov (M1_NM,16) SKR_S(1,0)<1> %1(0,8)<16;8,1>\n" \
+        "mov (M1_NM,16) SKR_S(2,0)<1> %1(2,0)<16;8,1>\n" \
+        "mov (M1_NM,16) SKR_S(3,0)<1> %1(2,8)<16;8,1>\n" \
+        "mov (M1_NM,16) SKR_S(4,0)<1> %1(4,0)<16;8,1>\n" \
+        "mov (M1_NM,16) SKR_S(5,0)<1> %1(4,8)<16;8,1>\n" \
+        "mov (M1_NM,16) SKR_S(6,0)<1> %1(6,0)<16;8,1>\n" \
+        "mov (M1_NM,16) SKR_S(7,0)<1> %1(6,8)<16;8,1>\n" \
+        #op " (M1_NM,16) SKR_T(0,0)<1> SKR_S(0,0)<1;1,0> SKR_S(1,0)<1;1,0>\n" \
+        #op " (M1_NM,16) SKR_T(1,0)<1> SKR_S(2,0)<1;1,0> SKR_S(3,0)<1;1,0>\n" \
+        #op " (M1_NM,16) SKR_T(2,0)<1> SKR_S(4,0)<1;1,0> SKR_S(5,0)<1;1,0>\n" \
+        #op " (M1_NM,16) SKR_T(3,0)<1> SKR_S(6,0)<1;1,0> SKR_S(7,0)<1;1,0>\n" \
+        "mov (M1_NM,16) SKR_S(8,0)<1> SKR_T(0,0)<8;4,1>\n" \
+        "mov (M1_NM,16) SKR_S(9,0)<1> SKR_T(0,4)<8;4,1>\n" \
+        "mov (M1_NM,16) SKR_S(10,0)<1> SKR_T(2,0)<8;4,1>\n" \
+        "mov (M1_NM,16) SKR_S(11,0)<1> SKR_T(2,4)<8;4,1>\n" \
+        #op " (M1_NM,16) SKR_T(4,0)<1> SKR_S(8,0)<1;1,0> SKR_S(9,0)<1;1,0>\n" \
+        #op " (M1_NM,16) SKR_T(5,0)<1> SKR_S(10,0)<1;1,0> SKR_S(11,0)<1;1,0>\n" \
+        "mov (M1_NM,16) SKR_S(12,0)<1> SKR_T(4,0)<4;2,1>\n" \
+        "mov (M1_NM,16) SKR_S(13,0)<1> SKR_T(4,2)<4;2,1>\n" \
+        #op " (M1_NM,16) SKR_T(6,0)<1> SKR_S(12,0)<1;1,0> SKR_S(13,0)<1;1,0>\n" \
+        "mov (M1_NM,8) SKR_S(14,0)<1> SKR_T(6,0)<2;1,0>\n" \
+        "mov (M1_NM,8) SKR_S(15,0)<1> SKR_T(6,1)<2;1,0>\n" \
+        #op " (M1_NM,8) %0(0,0)<1> SKR_S(14,0)<1;1,0> SKR_S(15,0)<1;1,0>\n" \
+        "}\n" : "=rw"(y) : "rw"(x)); \
+    return y; \
+  }
+SK_DEFINE_HREDUCE16(max)
+SK_DEFINE_HREDUCE16(add)
+SK_DEFINE_HREDUCE8(max)
+SK_DEFINE_HREDUCE8(add)
+#undef SK_DEFINE_HREDUCE16
+#undef SK_DEFINE_HREDUCE8
+#endif
+
 /**
  * @brief Transposing butterfly: reduce ROWS per-lane row partials across the 16
  * SIMD lanes so that lane L ends with the reduction of row L (L % ROWS).
@@ -49,6 +153,23 @@ inline float reduce_16x16(const sycl::float2 *first_half,
 template <typename op, typename type, int ROWS>
 static inline type transpose_reduce_rows(type (&a)[ROWS], int lane) {
   static_assert(ROWS == 16 || ROWS == 8, "16 or 8 rows per SIMD16 tile");
+#ifdef __SYCL_DEVICE_ONLY__
+  constexpr bool is_max = std::is_same_v<op, base_ops::max>;
+  constexpr bool is_sum = std::is_same_v<op, base_ops::sum>;
+  if constexpr (std::is_same_v<type, float> && (is_max || is_sum)) {
+    if constexpr (ROWS == 16) {
+      sk_float16v v;
+#pragma unroll
+      for (int r = 0; r < 16; r++) v[r] = a[r];
+      return is_max ? sk_hreduce16_max(v) : sk_hreduce16_add(v);
+    } else {
+      sk_float8v v;
+#pragma unroll
+      for (int r = 0; r < 8; r++) v[r] = a[r];
+      return is_max ? sk_hreduce8_max(v) : sk_hreduce8_add(v);
+    }
+  }
+#endif
 #pragma unroll
   for (int s = ROWS / 2; s >= 1; s >>= 1) {
     const bool hi = (lane & s) != 0;
