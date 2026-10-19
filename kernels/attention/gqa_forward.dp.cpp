@@ -195,15 +195,25 @@ SYCL_EXTERNAL void attend_ker_gqa_fwd(
   using v_desc_t  = gl_desc<16, 32, 16, 2, true>;
   using pf_desc_t = gl_desc<16, 32, 32, 1>;
   constexpr int v_cols = D / (SPLIT_D ? 2 : 1);
-  const long kv_off = ((long)batch_id * Kg.depth() * Kg.rows() + kv_head_id) * D;
-  const int kv_pitch = Kg.rows() * D * (int)sizeof(bf16);
-  const int kv_rows  = Kg.depth();
+  // The slice offset and pitch come from each gl's own stride accessor -- the
+  // same one global_to_register and friends use -- so this site cannot drift
+  // from the layout the rest of the library assumes. K and V are derived
+  // separately: sharing one set of numbers was only correct because the two
+  // happen to be constructed with identical dims.
+  const long k_off = (long)batch_id   * (long)Kg.template stride<0>()
+                   + (long)kv_head_id * (long)Kg.template stride<2>();
+  const long v_off = (long)batch_id   * (long)Vg.template stride<0>()
+                   + (long)kv_head_id * (long)Vg.template stride<2>();
+  const int k_pitch = (int)(Kg.template stride<1>() * sizeof(bf16));
+  const int v_pitch = (int)(Vg.template stride<1>() * sizeof(bf16));
+  const int k_rows  = Kg.depth();
+  const int v_rows  = Vg.depth();
   kt_desc_t k_desc; pf_desc_t k_pf;
   v_desc_t  v_desc; pf_desc_t v_pf;
-  k_desc.init(Kg.raw_ptr + kv_off, D * (int)sizeof(bf16), kv_rows, kv_pitch);
-  k_pf.init  (Kg.raw_ptr + kv_off, D * (int)sizeof(bf16), kv_rows, kv_pitch);
-  v_desc.init(Vg.raw_ptr + kv_off, D * (int)sizeof(bf16), kv_rows, kv_pitch);
-  v_pf.init  (Vg.raw_ptr + kv_off, D * (int)sizeof(bf16), kv_rows, kv_pitch);
+  k_desc.init(Kg.raw_ptr + k_off, D * (int)sizeof(bf16), k_rows, k_pitch);
+  k_pf.init  (Kg.raw_ptr + k_off, D * (int)sizeof(bf16), k_rows, k_pitch);
+  v_desc.init(Vg.raw_ptr + v_off, D * (int)sizeof(bf16), v_rows, v_pitch);
+  v_pf.init  (Vg.raw_ptr + v_off, D * (int)sizeof(bf16), v_rows, v_pitch);
 
   // Cooperative prefetch: every subgroup of the WG reads the same K/V tile,
   // so the next tile's pf_blocks 32x32 blocks (K then V columns) are split
