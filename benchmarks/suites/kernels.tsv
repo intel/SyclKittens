@@ -1,0 +1,56 @@
+# Which kernels exist, what they need, and how to build them.
+#
+# One source of truth for every benchmark runner, so the binary list is not
+# duplicated across perf_check.sh, baseline.sh and distributed.sh.
+# benchmarks/tools/select_kernels.py reads this and applies the filtering.
+#
+# Columns (whitespace-separated):
+#   path          <kernel-dir>/<binary-name> as produced by the dir's Makefile
+#   min_dev       fewest GPUs the binary will run on
+#   max_dev       most GPUs it will use; 0 means no upper bound, and a value
+#                 equal to min_dev means it accepts that count and no other
+#   tier          fast  = single-GPU, cheap and quiet; the PR gate default
+#                 full  = single-GPU, the rest
+#                 multi = needs more than one GPU
+#   make_target   target that produces it, as `make -C kernels/<dir> <target>`
+#
+# A binary runs when min_dev <= visible GPUs. When max_dev == min_dev it also
+# refuses any other count, because its NUM_DEVICES is compiled in with no
+# environment override. Single-GPU kernels use max_dev 0: they run on a 12-tile
+# host perfectly well, they just use one device.
+#
+# path                                       min_dev  max_dev  tier   make_target
+
+# -- single GPU, PR gate default ------------------------------------------
+# Covers the matrix, reduction and elementwise paths without the latency
+# probes or the oneMKL dependency that make the rest flaky to build.
+gemm/bf16_gemm_4096x4096x4096                      1        0  fast   all
+gemm/qkv_gemm                                      1        0  fast   all
+attention/gqa_forward                              1        0  fast   all
+norm/rmsnorm                                       1        0  fast   all
+activation/silu_mul                                1        0  fast   all
+# -- single GPU, the rest -------------------------------------------------
+attention/gqa_backward                             1        0  full   all
+norm/layernorm                                     1        0  full   all
+rotary/rotary                                      1        0  full   all
+rotary/rotary_qk                                   1        0  full   all
+rotary/rope_kvwrite                                1        0  full   all
+# decode links oneMKL for its GEMV fallback; needs MKLROOT on CPATH.
+decode/decode                                      1        0  full   all
+# -- multi GPU, scales with the device count ------------------------------
+# These three read SK_NUM_DEVICES, so they run on any count from 2 up.
+collective/all_reduce                              2       12  multi  standalone
+collective/all_gather                              2       12  multi  standalone
+collective/reduce_scatter                          2       12  multi  standalone
+# These three take min(visible, NUM_DEVICES_MAX), so they adapt on their own.
+context_attention/ring_attention                   2        6  multi  all
+context_attention/ring_attention_overlap           2       12  multi  all
+context_attention/all_gather_attention             2        6  multi  all
+
+# -- multi GPU, fixed topology --------------------------------------------
+# NUM_DEVICES is compiled in with no environment override, so these refuse to
+# run on anything but the exact count. benchmarks/suites/distributed.sh drives
+# them, since they also need an externally supplied ZE_AFFINITY_MASK.
+collective/gemm_rs                                 6        6  multi  all
+collective/all_to_all                             12       12  multi  standalone
+collective/ag_gemm                                12       12  multi  all
