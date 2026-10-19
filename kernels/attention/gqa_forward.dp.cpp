@@ -36,6 +36,8 @@
 
 #include "kittens.dp.hpp"
 #include "ops/warp/register/tile/conversions.dp.hpp"
+#include "ops/warp/memory/tile/gl_desc.dp.hpp"
+#include <utility>
 
 using namespace kittens;
 
@@ -111,6 +113,14 @@ struct fwd_cfg {
 // load->MMA fences alone cost up to ~15% at large-N causal. Do NOT re-add them.
 // ============================================================
 
+// Calls f(std::integral_constant<int, I>) for I = 0..N-1, so the block-load
+// offsets below stay compile-time immediates.
+template <int N, typename F> inline void static_for(F &&f) {
+  [&]<int... I>(std::integer_sequence<int, I...>) {
+    (f(std::integral_constant<int, I>{}), ...);
+  }(std::make_integer_sequence<int, N>{});
+}
+
 // ============================================================
 // Kernel (v16 compute core, parametrised on WG / SEQ_Q / CAUSAL)
 // ============================================================
@@ -176,16 +186,53 @@ SYCL_EXTERNAL void attend_ker_gqa_fwd(
     loop_kv_tiles = num_kv_tiles;
   }
 
-  // ── Prefetch first K tile ──────────────────────────────────
-  k_chunk_t k_pf;
-  #pragma unroll
-  for (int idx = 0; idx < PF && idx < loop_kv_tiles; idx++) {
-    #pragma unroll
-    for (int c = 0; c < inner_loop; c++) {
-      kittens::prefetch_load_part<1>(k_pf, Kg,
-                                     {batch_id, idx, kv_head_id, 0}, {0, c});
+  // ── K/V block-load payloads, built once (sycl-tla style) ──
+  // Each (batch, kv_head) slice of K/V is an N_kv x D surface; inside the loop
+  // only the row (Y) is updated, every other offset is an immediate. Shapes
+  // match the flat loads they replace: K^T as d32 8x16 transposed blocks, V as
+  // VNNI 16x32x2, prefetches as 32x32 bf16.
+  using kt_desc_t = gl_desc<32, 16, 8, 1, false, true>;
+  using v_desc_t  = gl_desc<16, 32, 16, 2, true>;
+  using pf_desc_t = gl_desc<16, 32, 32, 1>;
+  constexpr int v_cols = D / (SPLIT_D ? 2 : 1);
+  // The slice offset and pitch come from each gl's own stride accessor -- the
+  // same one global_to_register and friends use -- so this site cannot drift
+  // from the layout the rest of the library assumes. K and V are derived
+  // separately: sharing one set of numbers was only correct because the two
+  // happen to be constructed with identical dims.
+  const long k_off = (long)batch_id   * (long)Kg.template stride<0>()
+                   + (long)kv_head_id * (long)Kg.template stride<2>();
+  const long v_off = (long)batch_id   * (long)Vg.template stride<0>()
+                   + (long)kv_head_id * (long)Vg.template stride<2>();
+  const int k_pitch = (int)(Kg.template stride<1>() * sizeof(bf16));
+  const int v_pitch = (int)(Vg.template stride<1>() * sizeof(bf16));
+  const int k_rows  = Kg.depth();
+  const int v_rows  = Vg.depth();
+  kt_desc_t k_desc; pf_desc_t k_pf;
+  v_desc_t  v_desc; pf_desc_t v_pf;
+  k_desc.init(Kg.raw_ptr + k_off, D * (int)sizeof(bf16), k_rows, k_pitch);
+  k_pf.init  (Kg.raw_ptr + k_off, D * (int)sizeof(bf16), k_rows, k_pitch);
+  v_desc.init(Vg.raw_ptr + v_off, D * (int)sizeof(bf16), v_rows, v_pitch);
+  v_pf.init  (Vg.raw_ptr + v_off, D * (int)sizeof(bf16), v_rows, v_pitch);
+
+  // Cooperative prefetch: every subgroup of the WG reads the same K/V tile,
+  // so the next tile's pf_blocks 32x32 blocks (K then V columns) are split
+  // across the subgroups instead of each subgroup prefetching all of them.
+  constexpr int pf_blocks = 2 * (D / kv_stride);
+  auto prefetch_tile = [&](int tile) {
+    for (int b = sg_id % pf_blocks; b < pf_blocks; b += num_sg) {
+      if (b < pf_blocks / 2) {
+        k_pf.set_block(b * kv_stride, tile * kv_stride);
+        k_pf.prefetch();
+      } else {
+        v_pf.set_block((b - pf_blocks / 2) * kv_stride, tile * kv_stride);
+        v_pf.prefetch();
+      }
     }
-  }
+  };
+
+  // ── Prefetch first K/V tile ────────────────────────────────
+  if (PF > 0 && loop_kv_tiles > 0) prefetch_tile(0);
 
   int prefetch = PF;
 
@@ -199,17 +246,21 @@ SYCL_EXTERNAL void attend_ker_gqa_fwd(
     zero(att_block);
     max_vec_last = max_vec;
 
+    k_desc.set_y(i * kv_stride);
+    v_desc.set_y(i * kv_stride);
+    if (prefetch < loop_kv_tiles) prefetch_tile(prefetch);
+
     // ── Step 1: S[seq_q×32] = Q[seq_q×D] × K^T[D×32] ──────
     k_chunk_t k_reg;
-    #pragma unroll
-    for (int c = 0; c < inner_loop; c++) {
-      kittens::load_transpose_part<1>(k_reg, Kg,
-                                      {batch_id, i, kv_head_id, 0}, {0, c});
-      if (prefetch < loop_kv_tiles)
-        kittens::prefetch_load_part<1>(k_reg, Kg,
-                                       {batch_id, prefetch, kv_head_id, 0}, {0, c});
+    static_for<inner_loop>([&](auto c) {
+      constexpr int x = decltype(c)::value * kv_stride / 2;   // d32 column
+      int *kd = reinterpret_cast<int *>(&k_reg.tiles[0][0].data[0]);
+      k_desc.template load<x,     0 >(kd);
+      k_desc.template load<x + 8, 0 >(kd + 8);
+      k_desc.template load<x,     16>(kd + 16);
+      k_desc.template load<x + 8, 16>(kd + 24);
       mma<transpose::N, transpose::T>(att_block, q_preloaded[c], k_reg, att_block);
-    }
+    });
 
     // ── Step 2: Causal mask ────────────────────────────────
     if constexpr (CAUSAL_T) {
@@ -242,25 +293,19 @@ SYCL_EXTERNAL void attend_ker_gqa_fwd(
     p_mma_t p_mma;
     p_mma = att_block;  // float→bf16 conversion
 
+    // V columns [h*v_cols, (h+1)*v_cols) into v_reg.
     v_half_t v_reg;
+    auto load_v = [&](auto h) {
+      static_for<v_half_t::width>([&](auto j) {
+        v_desc.template load<decltype(h)::value * v_cols + decltype(j)::value * kv_stride, 0>(
+            &v_reg.tiles[0][decltype(j)::value].data[0]);
+      });
+    };
+    load_v(std::integral_constant<int, 0>{});
+    mma<transpose::N, transpose::N>(o_reg_1, p_mma, v_reg, o_reg_1);
     if constexpr (SPLIT_D) {
-      kittens::load_part<1>(v_reg, Vg, {batch_id, i, kv_head_id, 0}, {0, 0});
-      mma<transpose::N, transpose::N>(o_reg_1, p_mma, v_reg, o_reg_1);
-      if (prefetch < loop_kv_tiles)
-        kittens::prefetch_load_part<1>(v_reg, Vg,
-                                       {batch_id, prefetch, kv_head_id, 0}, {0, 0});
-      kittens::load_part<1>(v_reg, Vg,
-                            {batch_id, i, kv_head_id, 0}, {0, second_index_start});
+      load_v(std::integral_constant<int, 1>{});
       mma<transpose::N, transpose::N>(o_reg_2, p_mma, v_reg, o_reg_2);
-      if (prefetch < loop_kv_tiles)
-        kittens::prefetch_load_part<1>(v_reg, Vg,
-                                       {batch_id, prefetch, kv_head_id, 0},
-                                       {0, second_index_start});
-    } else {
-      kittens::load<1>(v_reg, Vg, {batch_id, i, kv_head_id, 0});
-      mma<transpose::N, transpose::N>(o_reg_1, p_mma, v_reg, o_reg_1);
-      if (prefetch < loop_kv_tiles)
-        kittens::prefetch_load<1>(v_reg, Vg, {batch_id, prefetch, kv_head_id, 0});
     }
   }
 
@@ -355,6 +400,12 @@ static inline fwd_choice choose_fwd(int N, int B, bool causal, bool bf16_out) {
     // default. bf16 and f32 winners diverge on 22 shapes (the bf16 store
     // epilogue shifts the register-pressure balance), so we keep two tables.
     // N>2048 is uniformly wg256/sq16 (both dtypes, both causal, all B).
+#ifdef KITTENS_BMG
+    // B70 (Xe2) sweep, bf16 out, B in {1,4}, N 512..8192: with the register-
+    // region row reductions wg256/sq8 is fastest (or within noise) for every
+    // causal and non-causal shape (non-causal N4096: 77 vs 50 TF for wg256/sq16).
+    if (bf16_out && N >= 512) return fwd_choice{256, 8};
+#endif
     if (N > 2048) return fwd_choice{256, 16};
     if (bf16_out) {
       if (causal) {

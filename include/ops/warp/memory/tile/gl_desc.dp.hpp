@@ -37,8 +37,9 @@
  *  - Register cost: each live `gl_desc` is ~1 GRF. GEMM runs near the 256-GRF
  *    ceiling — share one descriptor per operand-stream and advance X/Y rather
  *    than holding many; re-run spillcheck after adopting.
- *  - The `.load()` inline asm is unvalidated in THIS tree until you build+run
- *    it on PVC. Confirm bit-exact against the flat load before trusting it.
+ *  - Validated on B70 (Xe2) by the attention forward K/V loads (transposed,
+ *    VNNI and prefetch), which match the flat path's output. PVC builds but
+ *    has not been run; confirm against the flat load there before trusting it.
  * ============================================================================
  */
 
@@ -60,20 +61,26 @@ namespace kittens {
  * @tparam VNNI        true selects the transform/VNNI read (`nt`, matches
  *                     Subgroup2DBlockLoadTransformINTEL — the B operand);
  *                     false selects the plain read (`nn` — the A operand).
+ * @tparam Transpose   true selects the transposed read (`tn`, matches
+ *                     Subgroup2DBlockLoadTransposeINTEL; NumBlocks must be 1).
  *
  * Coordinates are ELEMENT coordinates (identical to the {col,row} the flat
  * intrinsic takes): X = contiguous/column element index, Y = strided/row
  * element index.
  */
 template <int Bits, int BlockHeight, int BlockWidth, int NumBlocks,
-          bool VNNI = false>
+          bool VNNI = false, bool Transpose = false>
 struct gl_desc {
+  static_assert(!(VNNI && Transpose), "VNNI and transposed reads are exclusive");
+  static_assert(!Transpose || NumBlocks == 1, "transposed reads take one block");
+
   int *payload = nullptr; ///< the block2d address payload (one GRF, built once)
 
   static constexpr int sg_size = 16;
   static constexpr int atom_width = BlockWidth * NumBlocks; ///< total contiguous elems
   // Per-lane storage vector matching the flat load's deposited bytes.
-  using elem_t = std::conditional_t<(Bits <= 16), short, int>;
+  // VNNI packs 32/Bits rows into each dword, so it is read back as int.
+  using elem_t = std::conditional_t<(Bits <= 16 && !VNNI), short, int>;
   static constexpr int lane_count =
       (atom_width * BlockHeight * Bits / sg_size) /
       static_cast<int>(sizeof(elem_t) * 8);
@@ -92,14 +99,18 @@ struct gl_desc {
 
   template <ducks::gl::all GL> inline void init(const GL &g) {
     using U = typename GL::dtype;
-    const long base = reinterpret_cast<long>(g.raw_ptr);
-    const int width_bytes = static_cast<int>(g.template shape<3>() * sizeof(U));
-    const int height = static_cast<int>(g.template shape<2>());
-    const int pitch_bytes =
-        static_cast<int>(g.template stride<2>() * sizeof(U));
+    init(g.raw_ptr, static_cast<int>(g.template shape<3>() * sizeof(U)),
+         static_cast<int>(g.template shape<2>()),
+         static_cast<int>(g.template stride<2>() * sizeof(U)));
+  }
+
+  /// Build the payload for an arbitrary 2D surface (sizes in bytes / rows).
+  inline void init(const void *base, int width_bytes, int height,
+                   int pitch_bytes) {
     payload = __builtin_IB_subgroup_createBlock2DAddressPayload(
-        base, width_bytes - 1, height - 1, pitch_bytes - 1,
-        /*blockX=*/0, /*blockY=*/0, BlockWidth, BlockHeight, NumBlocks);
+        reinterpret_cast<long>(base), width_bytes - 1, height - 1,
+        pitch_bytes - 1, /*blockX=*/0, /*blockY=*/0, BlockWidth, BlockHeight,
+        NumBlocks);
   }
 
   /// Set both surface coordinates (element units).
@@ -127,22 +138,29 @@ struct gl_desc {
   /**
    * @brief Load the block(s) into register-tile storage. `dst` is the same
    *        pointer the flat path writes (e.g. &reg.tiles[i][j].data[0]); the
-   *        deposited bytes are bit-identical. Mirrors sycl-tla XE_LOAD_2D /
-   *        XE_LOAD_2D_VNNI.
+   *        deposited bytes are bit-identical. DX/DY are compile-time offsets
+   *        (in `Bits`-sized elements / rows) added to the current X/Y, so a
+   *        fixed pattern of loads around one coordinate needs no payload
+   *        update. Mirrors sycl-tla XE_LOAD_2D / _VNNI / _TRANSPOSE.
    */
-  template <typename T> inline void load(T *dst) const {
+  template <int DX = 0, int DY = 0, typename T> inline void load(T *dst) const {
 #ifdef __SYCL_DEVICE_ONLY__
     auto &dv = *reinterpret_cast<store_vec_t *>(dst);
-    if constexpr (VNNI) {
-      asm("lsc_load_block2d.ugm (M1, 1)  %0:d%2.%3x%4x%5nt flat[%1+(0,0)]"
+    if constexpr (Transpose) {
+      asm("lsc_load_block2d.ugm (M1, 1)  %0:d%2.%3x%4tn flat[%1+(%5,%6)]"
+          : "=rw"(dv)
+          : "rw.u"(payload), "P"(Bits), "P"(BlockWidth), "P"(BlockHeight),
+            "P"(DX), "P"(DY));
+    } else if constexpr (VNNI) {
+      asm("lsc_load_block2d.ugm (M1, 1)  %0:d%2.%3x%4x%5nt flat[%1+(%6,%7)]"
           : "=rw"(dv)
           : "rw.u"(payload), "P"(Bits), "P"(NumBlocks), "P"(BlockWidth),
-            "P"(BlockHeight));
+            "P"(BlockHeight), "P"(DX), "P"(DY));
     } else {
-      asm("lsc_load_block2d.ugm (M1, 1)  %0:d%2.%3x%4x%5nn flat[%1+(0,0)]"
+      asm("lsc_load_block2d.ugm (M1, 1)  %0:d%2.%3x%4x%5nn flat[%1+(%6,%7)]"
           : "=rw"(dv)
           : "rw.u"(payload), "P"(Bits), "P"(NumBlocks), "P"(BlockWidth),
-            "P"(BlockHeight));
+            "P"(BlockHeight), "P"(DX), "P"(DY));
     }
 #else
     (void)dst;
@@ -162,10 +180,11 @@ struct gl_desc {
    * load coordinate is clobbered. See the migration recipe. Each extra
    * descriptor is ~1 GRF; re-run spillcheck.
    */
-  inline void prefetch() const {
+  template <int DX = 0, int DY = 0> inline void prefetch() const {
 #ifdef __SYCL_DEVICE_ONLY__
-    asm("lsc_load_block2d.ugm.ca.ca (M1, 1)  %%null:d%1.%2x%3nn flat[%0+(0,0)]"
-        :: "rw.u"(payload), "P"(Bits), "P"(atom_width), "P"(BlockHeight));
+    asm("lsc_load_block2d.ugm.ca.ca (M1, 1)  %%null:d%1.%2x%3nn flat[%0+(%4,%5)]"
+        :: "rw.u"(payload), "P"(Bits), "P"(atom_width), "P"(BlockHeight),
+           "P"(DX), "P"(DY));
 #endif
   }
 };
