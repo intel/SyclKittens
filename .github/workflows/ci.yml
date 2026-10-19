@@ -19,4 +19,17 @@ jobs:
       - name: Check benchmark tooling syntax
         run: |
           bash -n benchmarks/suites/distributed.sh
+          bash -n benchmarks/suites/perf_check.sh
           python3 -m py_compile benchmarks/tools/capture_manifest.py
+          python3 -m py_compile benchmarks/tools/parse_baseline.py
+          python3 -m py_compile benchmarks/tools/perf_gate.py
+          python3 -m py_compile benchmarks/tools/select_kernels.py
+      # The perf gate's verdict logic is what decides whether a PR is blocked,
+      # so it is tested here. These tests synthesise their own logs and need no GPU.
+      - name: Test perf gate verdict logic
+        run: python3 benchmarks/tools/test_perf_gate.py
+      # Selection decides what a run measures. A broken manifest row -- or one
+      # naming a kernel dir that no longer exists -- would shrink the gate
+      # silently, so it is checked on every PR rather than on the GPU host.
+      - name: Test kernel selection and manifest
+        run: python3 benchmarks/tools/test_select_kernels.py
